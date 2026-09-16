@@ -22,6 +22,7 @@
 #include "AscensionRunemasterEchoes.h"
 #include "AscensionCollectionModelData.h"
 #include "AscensionAmmunitionData.h"
+#include "AscensionPersonalBank.h"
 #include "AscensionCollectibleSpellData.h"
 #include "AscensionCustomClassData.h"
 #include "AscensionAuraAmounts.h"
@@ -57,6 +58,8 @@
 #include "DBCStores.h"
 #include "GossipDef.h"
 #include "GlobalScript.h"
+#include "GridTerrainData.h"
+#include "GuildPackets.h"
 #include "Item.h"
 #include "ItemScript.h"
 #include "LocalLevelScaling.h"
@@ -112,8 +115,103 @@ constexpr uint16 SMSG_CAN_SEE_APPEARANCES_INFO = 0x06A2;
 constexpr uint16 CMSG_SET_CAN_SEE_APPEARANCES = 0x06A3;
 constexpr uint16 SMSG_VANITY_COLLECTION_INFO = 0x06F7;
 constexpr uint16 SMSG_VANITY_COLLECTION_ADDED = 0x06F8;
+
+// A store record, as the client's own handler reads it for this opcode: a result code, a count,
+// and that many fixed records. One record is the catalogue row's first sixteen columns, costs
+// included. The module sends them alongside the ownership list; nothing on this realm acts on
+// what comes back.
+constexpr uint16 SMSG_QUERY_CUSTOM_STORE_RESULT = 0x06BA;
+constexpr std::size_t VANITY_STORE_RECORD_DWORDS = 16;
 constexpr uint16 SMSG_CHARACTER_ADVANCEMENT_AUTHENTICATION = 0x0725;
 constexpr uint16 CMSG_MISSILE_FIRE_POSITION = 0x09C7;
+
+// The client carries a personal-bank mode on top of the guild vault window. It is
+// switched on by this packet, not by the item's spell: clicking the summoned
+// guild-vault object sends the ordinary CMSG_GUILD_BANKER_ACTIVATE, and the
+// server answers with SMSG_BANK_PERMISSIONS so the frame presents itself as the
+// character's own bank (purchasable tabs, depositable soulbound items) instead of
+// a guild's. The id comes from the client's own opcode table in Extensions.dll:
+// it is a contiguous array of name stubs indexed by id - 1, so
+// `id = index + 1`, which resolves every opcode seen in this realm's packet log
+// (0x0741 = CMSG_GOSSIP_CLOSE, 0x061B = CMSG_ITEM_QUERY_BULK, and the ids below).
+constexpr uint16 SMSG_BANK_PERMISSIONS = 0x0769;
+
+struct ExtensionOpcodeIdentity {
+  uint16 Opcode;
+  char const *Name;
+};
+
+constexpr ExtensionOpcodeIdentity EXTENSION_OPCODES[] = {
+    {CMSG_ANTICHEAT_ALERT, "CMSG_ANTICHEAT_ALERT"},
+    {CMSG_VANITY_DELIVERY, "CMSG_VANITY_DELIVERY"},
+    {0x053B, "CMSG_ASCENSIONGM_TICKET_LIST_REQUEST"},
+    {0x0561, "CMSG_EXTENSION_INITIALIZED"},
+    {0x05A1, "CMSG_CHALLENGE_QUERY_FAILURE"},
+    {0x061B, "CMSG_ITEM_QUERY_BULK"},
+    {0x0667, "CMSG_SET_LEVEL_SCALING"},
+    {CMSG_APPLY_APPEARANCES, "CMSG_APPLY_APPEARANCES"},
+    {SMSG_APPLY_APPEARANCES_RESULT, "SMSG_APPLY_APPEARANCES_RESULT"},
+    {SMSG_APPEARANCE_COLLECTION_INFO, "SMSG_APPEARANCE_COLLECTION_INFO"},
+    {SMSG_APPEARANCE_ACTIVE_INFO, "SMSG_APPEARANCE_ACTIVE_INFO"},
+    {SMSG_APPEARANCE_ADDED, "SMSG_APPEARANCE_ADDED"},
+    {SMSG_APPEARANCE_OUTFIT_INFO, "SMSG_APPEARANCE_OUTFIT_INFO"},
+    {SMSG_CAN_SEE_APPEARANCES_INFO, "SMSG_CAN_SEE_APPEARANCES_INFO"},
+    {CMSG_SET_CAN_SEE_APPEARANCES, "CMSG_SET_CAN_SEE_APPEARANCES"},
+    {0x06B9, "CMSG_QUERY_CUSTOM_STORE"},
+    {SMSG_VANITY_COLLECTION_INFO, "SMSG_VANITY_COLLECTION_INFO"},
+    {SMSG_VANITY_COLLECTION_ADDED, "SMSG_VANITY_COLLECTION_ADDED"},
+    {SMSG_QUERY_CUSTOM_STORE_RESULT, "SMSG_QUERY_CUSTOM_STORE_RESULT"},
+    {0x06FD, "CMSG_QUERY_INSTANCE_BINDS"},
+    {SMSG_CHARACTER_ADVANCEMENT_AUTHENTICATION, "SMSG_CHARACTER_ADVANCEMENT_AUTHENTICATION"},
+    {0x0741, "CMSG_GOSSIP_CLOSE"},
+    {0x0745, "CMSG_PLAYER_POLL_LIST_REQUEST"},
+    {SMSG_BANK_PERMISSIONS, "SMSG_BANK_PERMISSIONS"},
+    {0x0777, "CMSG_STATISTIC_QUERY"},
+    {CMSG_MISSILE_FIRE_POSITION, "CMSG_MISSILE_FIRE_POSITION"},
+};
+
+[[nodiscard]] char const *ExtensionOpcodeName(uint16 opcode) {
+  for (ExtensionOpcodeIdentity const &entry : EXTENSION_OPCODES)
+    if (entry.Opcode == opcode)
+      return entry.Name;
+  return nullptr;
+}
+
+/// First bytes of a packet, for protocol work: the compatibility log has to be
+/// able to say what an unknown extension packet carried, not just how long it was.
+[[nodiscard]] std::string DescribePacketPayload(WorldPacket const &packet,
+                                                std::size_t limit = 64) {
+  // ByteBuffer::contents() throws ByteBufferException on an empty buffer - the
+  // core relies on that (WorldSocket's addon-info read says so). A log line must
+  // never be the reason a packet kills the process, so read the size first and
+  // keep the call guarded: an empty extension packet is now described as empty
+  // instead of throwing out of the network thread.
+  std::size_t const size = packet.size();
+  if (!size)
+    return "";
+
+  std::size_t count = std::min(size, limit);
+  uint8 const *bytes = nullptr;
+  try {
+    bytes = const_cast<WorldPacket &>(packet).contents();
+  } catch (...) {
+    return "<unreadable>";
+  }
+  if (!bytes || !count)
+    return "";
+
+  static constexpr char HEX_DIGITS[] = "0123456789ABCDEF";
+  std::string description;
+  description.reserve(count * 3);
+  for (std::size_t i = 0; i < count; ++i) {
+    description += HEX_DIGITS[(bytes[i] >> 4) & 0x0F];
+    description += HEX_DIGITS[bytes[i] & 0x0F];
+    description += ' ';
+  }
+  if (packet.size() > limit)
+    description += "...";
+  return description;
+}
 
 constexpr uint32 SPELL_PYROMANCER_HEAT = 807389;
 constexpr uint32 SPELL_PYROMANCER_EMBER = 807533;
@@ -266,6 +364,9 @@ struct VanityInfo {
   uint32 LearnedSpell = 0;
   uint32 Flags = 0;
   uint32 CategoryMask = 0;
+  /// The catalogue row's first sixteen columns, which is the shape of one store record: the item
+  /// id, its flags, its group and the three costs.
+  std::array<uint32, VANITY_STORE_RECORD_DWORDS> StoreRecord{};
 };
 
 struct PlayerCollectionState {
@@ -2383,12 +2484,19 @@ public:
                             if (!itemId)
                               return;
 
-                            _vanityItems[itemId] =
+                            VanityInfo info{
                                 // f44 is an empty locale column. The physical
                                 // record has 77 DWORDs; f76 is LearnedSpell.
-                                VanityInfo{ReadRecordField(record, 76),
-                                           ReadRecordField(record, 12),
-                                           ReadRecordField(record, 2)};
+                                ReadRecordField(record, 76),
+                                ReadRecordField(record, 12),
+                                ReadRecordField(record, 2)};
+
+                            // The same row is what the client stores as a vanity store record,
+                            // so the packet is built from it rather than from a second table.
+                            for (std::size_t field = 0; field < VANITY_STORE_RECORD_DWORDS; ++field)
+                              info.StoreRecord[field] = ReadRecordField(record, field);
+
+                            _vanityItems[itemId] = info;
                             _allVanityItemIds.push_back(itemId);
                           });
 
@@ -2459,6 +2567,7 @@ public:
     SendOutfitCollection(player);
     SendAppearanceVisibility(player, *state);
     SendVanityCollection(player, *state);
+    SendOwnedVanityStoreRecords(player, *state);
     RefreshVisibleItems(player);
     // Reconcile any aura saved by an older session against the authoritative wardrobe selection.
     for (auto const& [id, appearance] : _appearances)
@@ -2612,6 +2721,117 @@ public:
             LOG_INFO("module.ascension_compat", "Prepared {} account mount/companion spells for {} before entering the world",
                 learned, player->GetName());
         }
+    }
+
+    /// The bank items this repack ships - the two Personal Bank entries, the Celestial and the
+    /// Realm Bank. Their first spell is the summon that places the vault, so the spell is read
+    /// from the item template instead of being written out a second time here.
+    static constexpr std::array<uint32, 4> BankVanityItems = { 110000, 134985, 509892, 1180097 };
+
+    [[nodiscard]] static bool IsBankVanityItem(uint32 itemId)
+    {
+        return std::find(BankVanityItems.begin(), BankVanityItems.end(), itemId) != BankVanityItems.end();
+    }
+
+    /// Has this character acquired that bank?
+    ///
+    /// A bank is earned rather than part of the unlock-everything placeholder. Acquiring one -
+    /// the purchase on the live realm - writes the account's own collection row, and the character
+    /// then also holds it as the summon spell or as the item in a bag. Either way of holding it
+    /// counts, so a bank granted by hand (the spell learned, or the item handed over) behaves
+    /// exactly like one bought, and AscensionCompat.UnlockAllVanity is deliberately never
+    /// consulted here.
+    [[nodiscard]] bool OwnsBankVanityItem(Player* player, PlayerCollectionState const& state, uint32 itemId) const
+    {
+        if (state.OwnedVanityItems.contains(itemId) || player->HasItemCount(itemId))
+            return true;
+
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+        if (!proto)
+            return false;
+
+        for (uint8 slot = 0; slot < MAX_ITEM_PROTO_SPELLS; ++slot)
+        {
+            uint32 const spellId = uint32(std::max<int32>(proto->Spells[slot].SpellId, 0));
+            if (spellId && player->HasSpell(spellId))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// The summon spells of the banks this character owns, for every one not already learned.
+    ///
+    /// Learning the spell is the other half of owning a bank: the spell places the same vault the
+    /// item does, so a character who has one can summon it without carrying the item, and it is
+    /// what the placed-chest entitlement reads.
+    std::vector<uint32> GetMissingBankSpells(Player* player, PlayerCollectionState const& state) const
+    {
+        std::vector<uint32> spells;
+
+        for (uint32 itemId : BankVanityItems)
+        {
+            if (!OwnsBankVanityItem(player, state, itemId))
+                continue;
+
+            ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+            if (!proto)
+                continue;
+
+            for (uint8 slot = 0; slot < MAX_ITEM_PROTO_SPELLS; ++slot)
+            {
+                uint32 const spellId = uint32(std::max<int32>(proto->Spells[slot].SpellId, 0));
+                if (!spellId || player->HasSpell(spellId) || !sSpellMgr->GetSpellInfo(spellId))
+                    continue;
+
+                spells.push_back(spellId);
+            }
+        }
+
+        std::sort(spells.begin(), spells.end());
+        spells.erase(std::unique(spells.begin(), spells.end()), spells.end());
+        return spells;
+    }
+
+    /// Learns an owned bank's summon spell. Used both on the way into the world and at the moment
+    /// a bank item reaches a character.
+    void LearnOwnedBankSpells(Player* player, PlayerCollectionState const& state, bool beforeMap) const
+    {
+        std::size_t learned = 0;
+        for (uint32 spellId : GetMissingBankSpells(player, state))
+        {
+            player->learnSpell(spellId, false);
+            if (player->HasSpell(spellId))
+                ++learned;
+        }
+
+        if (!learned)
+            return;
+
+        // Outside the world the learned-spell snapshot has not been sent yet, so it has to be
+        // replaced once; in the world learnSpell emits its own learned-spell packet.
+        if (beforeMap)
+            player->SendInitialSpells();
+
+        LOG_INFO("module.ascension_compat", "Learned {} owned bank spell(s) for {}",
+                 learned, player->GetName());
+    }
+
+    /// Same place the companion spells are prepared, and for the same reason: the client's spell
+    /// list has not been sent yet, so a grant here needs no batching or UI thaw.
+    void PrepareOwnedBankSpellsBeforeMap(Player* player)
+    {
+        if (!_clientDataLoaded || player->IsInWorld() || !player->GetSession()->PlayerLoading())
+            return;
+
+        // The account's own list is what says a bank was acquired, so it is always read - this
+        // grant, unlike the mount and companion ones, does not follow the unlock-everything
+        // placeholder.
+        PlayerCollectionState state;
+        state.AccountId = player->GetSession()->GetAccountId();
+        LoadPlayerState(player, state);
+
+        LearnOwnedBankSpells(player, state, true);
     }
 
     std::vector<uint32> GetMissingOwnedCompanionSpells(Player* player, PlayerCollectionState const& state) const
@@ -2820,10 +3040,19 @@ public:
 
     bool unlockAll = ascensionCompatConfig.GetConfigValue<bool>(
         AscensionCompatConfig::UNLOCK_ALL_VANITY);
-    if (!unlockAll && !state->OwnedVanityItems.contains(itemId))
+
+    // A bank has to be acquired before it can be delivered, even while the placeholder unlocks
+    // everything else: the item is what an acquisition hands out, not a way to obtain the bank.
+    bool const entitled =
+        IsBankVanityItem(itemId)
+            ? OwnsBankVanityItem(player, *state, itemId)
+            : (unlockAll || state->OwnedVanityItems.contains(itemId));
+    if (!entitled)
     {
       ChatHandler(player->GetSession())
-          .SendSysMessage("That vanity item is not unlocked on this account.");
+          .SendSysMessage(IsBankVanityItem(itemId)
+              ? "That bank is not unlocked on this account."
+              : "That vanity item is not unlocked on this account.");
       return;
     }
 
@@ -2846,6 +3075,12 @@ public:
       }
 
       player->StoreNewItem(destinations, itemId, true);
+
+      // A bank is also owned as a spell, so the spell comes with the item rather than at the next
+      // login.
+      if (IsBankVanityItem(itemId))
+        LearnOwnedBankSpells(player, *state, false);
+
       return;
     }
 
@@ -3124,6 +3359,31 @@ private:
         player->GetSession()->SendPacket(&packet);
       }
     }
+
+    // Banks are acquired rather than covered by the placeholder, so their account record is
+    // written whatever UnlockAllVanity says. This is the record a purchase leaves, and it is what
+    // the login grant and the placed-chest entitlement both read - which makes the bank item
+    // itself the thing that "learns" the bank: handing 134985, 509892 or 1180097 to a character
+    // is the acquisition, and the spell follows immediately rather than at the next login.
+    if (IsBankVanityItem(itemId) && state.OwnedVanityItems.insert(itemId).second)
+    {
+      CharacterDatabase.Execute(
+          "INSERT IGNORE INTO `account_vanity_collection` (`account_id`, "
+          "`item_id`) VALUES ({}, {})",
+          state.AccountId, itemId);
+
+      if (notifyClient)
+      {
+        WorldPacket packet(SMSG_VANITY_COLLECTION_ADDED, sizeof(uint32));
+        packet << itemId;
+        player->GetSession()->SendPacket(&packet);
+      }
+
+      LearnOwnedBankSpells(player, state, !player->IsInWorld());
+      SendOwnedVanityStoreRecords(player, state);
+      LOG_INFO("module.ascension_compat", "Account {} acquired the bank item {} through {}",
+               state.AccountId, itemId, player->GetName());
+    }
   }
 
   void HandleClientPacket(Player *player, WorldPacket &packet) {
@@ -3331,12 +3591,27 @@ private:
         AscensionCompatConfig::UNLOCK_ALL_VANITY);
     std::vector<uint32> vanityItems;
     if (unlockAll)
+    {
       vanityItems = _allVanityItemIds;
+
+      // The banks are the exception to the placeholder: each is acquired on its own, so the client
+      // is told the account owns a bank only when it really does - nobody is offered a bank the
+      // account never acquired.
+      vanityItems.erase(
+          std::remove_if(vanityItems.begin(), vanityItems.end(),
+                         [](uint32 itemId) { return IsBankVanityItem(itemId); }),
+          vanityItems.end());
+
+      for (uint32 itemId : state.OwnedVanityItems)
+        if (IsBankVanityItem(itemId))
+          vanityItems.push_back(itemId);
+    }
     else
       vanityItems.assign(state.OwnedVanityItems.begin(),
                          state.OwnedVanityItems.end());
 
     std::sort(vanityItems.begin(), vanityItems.end());
+    vanityItems.erase(std::unique(vanityItems.begin(), vanityItems.end()), vanityItems.end());
     WorldPacket packet(SMSG_VANITY_COLLECTION_INFO,
                        sizeof(uint32) + vanityItems.size() * sizeof(uint32));
     packet << static_cast<uint32>(vanityItems.size());
@@ -3344,6 +3619,45 @@ private:
       packet << itemId;
 
     player->GetSession()->SendPacket(&packet);
+  }
+
+  /// Hands the client the store records for the vanity items the account owns.
+  ///
+  /// Sent with the ownership list, so the two agree about what the account owns. The records come
+  /// from the same catalogue rows the ownership list is built from.
+  void SendOwnedVanityStoreRecords(Player *player,
+                                   PlayerCollectionState const &state) {
+    std::vector<uint32> itemIds;
+    for (uint32 itemId : state.OwnedVanityItems)
+      if (_vanityItems.contains(itemId))
+        itemIds.push_back(itemId);
+
+    std::sort(itemIds.begin(), itemIds.end());
+    itemIds.erase(std::unique(itemIds.begin(), itemIds.end()), itemIds.end());
+
+    WorldPacket packet(SMSG_QUERY_CUSTOM_STORE_RESULT,
+                       64 + itemIds.size() * VANITY_STORE_RECORD_DWORDS * sizeof(uint32));
+    packet << "QUERY_CUSTOM_STORE_OK";
+    packet << static_cast<uint32>(itemIds.size());
+    for (uint32 itemId : itemIds)
+      for (uint32 field : _vanityItems.at(itemId).StoreRecord)
+        packet << field;
+
+    player->GetSession()->SendPacket(&packet);
+
+    if (!itemIds.empty())
+    {
+      std::string owned;
+      for (uint32 itemId : itemIds) {
+        if (!owned.empty())
+          owned += ' ';
+        owned += std::to_string(itemId);
+      }
+
+      LOG_INFO("module.ascension_compat",
+               "Sent {} vanity store record(s) to {} for owned item(s): {}",
+               itemIds.size(), player->GetName(), owned);
+    }
   }
 
   void SendApplyResult(Player *player, char const *result) {
@@ -3478,6 +3792,276 @@ bool SendCollectionCreatureQueryResponse(WorldSession* session, uint32 creatureI
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Personal bank, Celestial Personal Bank and Realm Bank.
+//
+// The three items are ordinary spell items (100702, 93416, 92078) whose spell
+// carries a dummy effect - the client shows "Summons your personal bank" and the
+// server is expected to do the rest. What it has to do is what the client was
+// patched for: the item summons a guild vault object (gameobject type 34), and
+// clicking that vault sends the ordinary CMSG_GUILD_BANKER_ACTIVATE. The client's
+// Blizzard_GuildBankUI.lua then waits for SMSG_BANK_PERMISSIONS, whose payload
+// its BANK_PERMISSIONS_PAYLOAD hook reads as GetBankPermissions() ->
+// (isPersonalBank, isRealmBank), and switches the vault frame to the
+// PERSONAL_BANK/REALM_BANK presentation: character-owned tabs, tab purchases,
+// and soulbound items allowed in.
+//
+// The stock core answers that activate with ERR_GUILD_PLAYER_NOT_IN_GUILD for a
+// character with no guild, so this module answers it instead - but only for the
+// vaults its own summon spells placed, which are remembered here for as long as
+// they live. Every other guild vault keeps the core's own handler untouched.
+enum PersonalBankKind : uint8
+{
+    PERSONAL_BANK_PERSONAL = 0,
+    PERSONAL_BANK_REALM = 1
+};
+
+enum PersonalBankSpell : uint32
+{
+    SPELL_PERSONAL_BANK = 100702,
+    SPELL_CELESTIAL_PERSONAL_BANK = 93416,
+    SPELL_REALM_BANK = 92078
+};
+
+// The objects CoA itself uses for this feature, captured from its client as type
+// 34 (the type the client opens a bank frame for): "Personal Belongings",
+// "Celestial Personal Belongings" and "Realm Belongings". Two entries exist per
+// faction, and their display ids are chests - 138006 alliancechest_01, 138007
+// hordechest_01, and 8691 ul_chest_cosmic for the Celestial one. They are absent
+// from this world database, so the module ships them (see this module's
+// 2026_09_16_01_ascension_bank_objects.sql).
+enum PersonalBankObject : uint32
+{
+    BANK_OBJECT_PERSONAL_ALLIANCE = 475001, // "Personal Belongings"
+    BANK_OBJECT_PERSONAL_HORDE = 475002,    // "Personal Belongings"
+    BANK_OBJECT_CELESTIAL = 80782,          // "Celestial Personal Belongings"
+    BANK_OBJECT_REALM_ALLIANCE = 80159,     // "Realm Belongings"
+    BANK_OBJECT_REALM_HORDE = 80160         // "Realm Belongings"
+};
+
+// How long a summoned vault stays in the world, and it is meant to match the items' own
+// cooldown (item_template.spellcooldown_1 = 600000 ms): summon it, use it for ten minutes,
+// and by the time the vault is gone the item is ready again.
+//
+// The unit is SECONDS, not milliseconds. `WorldObject::SummonGameObject` hands this straight to
+// `GameObject::SetRespawnTime`, which does `m_respawnTime = GameTime::GetGameTime() + respawn`,
+// and that second count is in seconds - so the old value of 5 * 60 * 1000 was read as 300000
+// seconds, three and a half days, and a vault only ever went away when the worldserver did.
+//
+// The timer belongs to the map object, not to the session: nothing tears a summoned object down
+// when its summoner logs out (the only removals are `GameObject::Delete` itself, spell cleanup
+// and duels), so the ten minutes keep running while the character is offline and the vault
+// despawns on its own whether or not they are there to see it.
+constexpr uint32 BANK_VAULT_DURATION = 10 * 60;
+
+/// The object the item summons: Celestial has its own, Realm and Personal bank
+/// differ only by the caster's faction.
+[[nodiscard]] uint32 BankObjectEntry(uint32 spellId, TeamId team)
+{
+    bool const alliance = team == TEAM_ALLIANCE;
+    if (spellId == SPELL_REALM_BANK)
+        return alliance ? BANK_OBJECT_REALM_ALLIANCE : BANK_OBJECT_REALM_HORDE;
+    if (spellId == SPELL_CELESTIAL_PERSONAL_BANK)
+        return BANK_OBJECT_CELESTIAL;
+    return alliance ? BANK_OBJECT_PERSONAL_ALLIANCE : BANK_OBJECT_PERSONAL_HORDE;
+}
+
+struct PersonalBankVault
+{
+    ObjectGuid Owner;
+    uint8 Kind = PERSONAL_BANK_PERSONAL;
+};
+
+std::unordered_map<ObjectGuid::LowType, PersonalBankVault> personalBankVaults;
+
+void SendBankPermissions(Player* player, uint8 kind)
+{
+    // Two flags, read in this order by the client's GetBankPermissions().
+    AscensionPersonalBank::SendKindHint(player, uint8(kind));
+}
+
+/// Whether this character owns the bank a placed vault stands for.
+///
+/// A bank is acquired, not part of the unlock-everything placeholder, so what counts is holding
+/// it: the summon spell (what acquiring one grants) or the item itself in a bag (what handing the
+/// bank item to a character gives them). AscensionCompat.UnlockAllVanity is deliberately not
+/// consulted - nobody gets a bank from it. The Celestial item is its own object but a personal
+/// bank underneath, so both personal entries count for the personal kind.
+[[nodiscard]] bool OwnsPlacedBank(Player* player, uint8 kind)
+{
+    static std::array<PersonalBankSpell, 2> const personalSpells =
+        { SPELL_PERSONAL_BANK, SPELL_CELESTIAL_PERSONAL_BANK };
+    static std::array<uint32, 3> const personalItems = { 110000, 134985, 509892 };
+
+    if (kind == PERSONAL_BANK_REALM)
+        return player->HasSpell(SPELL_REALM_BANK) || player->HasItemCount(1180097);
+
+    for (PersonalBankSpell spell : personalSpells)
+        if (player->HasSpell(spell))
+            return true;
+
+    for (uint32 item : personalItems)
+        if (player->HasItemCount(item))
+            return true;
+
+    return false;
+}
+
+/// True when the packet was one of our own vaults and has been answered here.
+bool HandlePersonalBankActivate(Player* player, WorldPacket const& packet)
+{
+    ObjectGuid banker;
+    bool fullUpdate = false;
+    try
+    {
+        WorldPacket copy(packet);
+        WorldPackets::Guild::GuildBankActivate activate(std::move(copy));
+        activate.Read();
+        banker = activate.Banker;
+        fullUpdate = activate.FullUpdate;
+    }
+    catch (...)
+    {
+        // A malformed activate is the core's problem to answer, with its own
+        // error handling - never an exception out of the network thread here.
+        return false;
+    }
+
+    auto itr = personalBankVaults.find(banker.GetCounter());
+    if (itr == personalBankVaults.end())
+        return false;
+
+    // A placed bank belongs to whoever walks up to it, which is how CoA's own did it: the vault
+    // only says *which* bank it is (its object entry), and the storage behind it is always the
+    // interacting character's own - their personal bank, or the single realm-wide one. Someone
+    // else's chest therefore opens your bank, not theirs. What entitles you to it is owning the
+    // bank, not having placed this particular chest; the summoner is kept only for the record.
+    if (!OwnsPlacedBank(player, itr->second.Kind))
+    {
+        ChatHandler(player->GetSession())
+            .PSendSysMessage("You do not own a {} bank.",
+                             itr->second.Kind == PERSONAL_BANK_REALM ? "Realm" : "Personal");
+        LOG_INFO("module.ascension_compat",
+                 "{} touched a {} bank placed by {} (vault {}) without owning one",
+                 player->GetName(),
+                 itr->second.Kind == PERSONAL_BANK_REALM ? "realm" : "personal",
+                 itr->second.Owner.ToString(), banker.ToString());
+        return true;
+    }
+
+    // The kind decides which bank this is; the storage behind it is the module's own
+    // (AscensionPersonalBank.cpp), which sends the rights and the tab list itself.
+    SendBankPermissions(player, itr->second.Kind);
+    AscensionPersonalBank::Opened(player, itr->second.Kind, banker);
+
+    LOG_INFO("module.ascension_compat",
+             "Personal bank opened for {} (kind {}, vault {}, full update {})",
+             player->GetName(), uint32(itr->second.Kind), banker.ToString(),
+             fullUpdate);
+    return true;
+}
+
+/// Height to summon the bank at: the caster's feet, snapped to a step within half a yard.
+///
+/// The map alone cannot be trusted for this. Measured in the inn where the bank kept landing
+/// wrong, the caster's feet read 56.3-56.6 across nine summons while the surface under the
+/// spot two yards ahead came back anywhere between 56.0 and 58.1 - that is the hillside the
+/// building is cut into, not the floor the player is standing on, which is why every summon
+/// landed somewhere different. A wider allowance let the hill set the height; a probe that
+/// starts above the surface (which is what `WorldObject::GetMapHeight` does, since it adds
+/// the object's collision height and Z_OFFSET_FIND_HEIGHT to the Z it is handed) makes it
+/// worse, because `Map::GetHeight` then returns whichever surface is nearer the probe.
+///
+/// So the feet are the reference: probe just above them, and only move the bank when a surface
+/// turns up within half a yard - a step, a kerb, a slight slope, which is the most it should
+/// ever differ from where the caster is standing. Anything further away is another level of
+/// the world (a roof, a cellar, the ground below a balcony) and is ignored.
+static float GroundHeightBeneath(Map* map, float x, float y, float feetZ)
+{
+    constexpr float PROBE_ABOVE_FEET = 0.3f;    // just above the floor the caster stands on
+    constexpr float STEP = 0.5f;                // a step away, either direction
+
+    float const height = map->GetHeight(x, y, feetZ + PROBE_ABOVE_FEET, true, STEP);
+    if (height > INVALID_HEIGHT && height <= feetZ + STEP && height >= feetZ - STEP)
+        return height;
+
+    return feetZ;
+}
+
+/// Puts the vault the item "summons" in front of the caster.
+class spell_ascension_personal_bank : public SpellScript
+{
+    PrepareSpellScript(spell_ascension_personal_bank);
+
+    void SummonBankVault()
+    {
+        Player* player = GetCaster() ? GetCaster()->ToPlayer() : nullptr;
+        if (!player || !player->IsInWorld())
+            return;
+
+        uint8 kind = PERSONAL_BANK_PERSONAL;
+        if (GetSpellInfo()->Id == SPELL_REALM_BANK)
+            kind = PERSONAL_BANK_REALM;
+
+        uint32 const entry = BankObjectEntry(GetSpellInfo()->Id, player->GetTeamId());
+
+        float x, y, z;
+        player->GetClosePoint(x, y, z, player->GetCombatReach(), 2.0f);
+
+        // GetClosePoint only places the spot beside the caster: GetNearPoint ends with
+        // `z = GetPositionZ()`, so the bank would keep the caster's height even where the
+        // ground beside them is a step lower or higher. Ground it on the surface they are
+        // standing on (see GroundHeightBeneath for why the probe starts at their feet).
+        z = GroundHeightBeneath(player->GetMap(), x, y, player->GetPositionZ());
+
+        // Summoned through the map rather than through the caster, and that is the whole point:
+        // `WorldObject::SummonGameObject` files the object under its summoner (`Unit::AddGameObject`),
+        // and `Unit::RemoveFromWorld` - which is what a logout runs - calls `RemoveAllGameObjects`
+        // and deletes every object filed there. A vault summoned by the player therefore vanished the
+        // moment they left the world. A map summon has no owner at all, so nothing tears it down
+        // early, and the core still gives it exactly the timed life below: `Map::SummonGameObject`
+        // marks it temporary (`SetSpellId(1)` + respawn time), and at expiry `GameObject::Update`
+        // sees a summoned object whose timer has run out and deletes it.
+        //
+        // The phase mask is copied from the caster afterwards, because a map summon is created in
+        // PHASEMASK_NORMAL - without this the vault would be invisible to anyone standing in a
+        // phase of their own.
+        GameObject* vault = player->GetMap()->SummonGameObject(
+            entry, x, y, z, player->GetOrientation(), 0.0f, 0.0f, 0.0f,
+            0.0f, BANK_VAULT_DURATION, true);
+        if (vault)
+            vault->SetPhaseMask(player->GetPhaseMask(), true);
+
+        if (!vault)
+        {
+            LOG_ERROR("module.ascension_compat",
+                      "Could not summon bank object {} for {} (spell {})",
+                      entry, player->GetName(), GetSpellInfo()->Id);
+            return;
+        }
+
+        personalBankVaults[vault->GetGUID().GetCounter()] = {player->GetGUID(), kind};
+
+        // Wait the same ten minutes as the vault just placed. The cooldown that a bank item shows
+        // comes from the item (`item_template.spellcooldown_1` = 600000 ms) and lives on no spell,
+        // so without this, casting the spell on its own would place a vault per keypress. Both
+        // routes are the same act: same spell, same vault, same wait.
+        player->AddSpellCooldown(GetSpellInfo()->Id, 0, BANK_VAULT_DURATION * IN_MILLISECONDS, true);
+
+        LOG_INFO("module.ascension_compat",
+                 "Summoned bank object {} (kind {}, entry {}, spell {}) for {} at "
+                 "{:.2f} {:.2f} {:.2f} (caster feet {:.2f})",
+                 vault->GetGUID().ToString(), uint32(kind), entry,
+                 GetSpellInfo()->Id, player->GetName(), x, y, z,
+                 player->GetPositionZ());
+    }
+
+    void Register() override
+    {
+        AfterCast += SpellCastFn(spell_ascension_personal_bank::SummonBankVault);
+    }
+};
+
 class AscensionCompatServerScript : public ServerScript {
 public:
   AscensionCompatServerScript()
@@ -3488,6 +4072,22 @@ public:
 
     [[nodiscard]] bool CanPacketReceive(WorldSession* session, WorldPacket const& packet) override
     {
+        if (session && session->GetPlayer())
+        {
+            Player* player = session->GetPlayer();
+
+            if (packet.GetOpcode() == CMSG_GUILD_BANKER_ACTIVATE)
+            {
+                if (HandlePersonalBankActivate(player, packet))
+                    return false;
+            }
+            // While one of our windows is open the client's bank conversation belongs to
+            // the personal bank, so none of it may reach the core's guild handling.
+            else if (AscensionPersonalBank::IsOpen(player) &&
+                     AscensionPersonalBank::HandlePacket(player, packet))
+                return false;
+        }
+
         if (!session || !session->GetPlayer() || packet.GetOpcode() != CMSG_CREATURE_QUERY ||
             packet.size() < sizeof(uint32) ||
             !ascensionCompatConfig.GetConfigValue<bool>(AscensionCompatConfig::ENABLED))
@@ -3604,8 +4204,8 @@ public:
               AscensionCompatConfig::LOG_CONSUMED_PACKETS))
       {
         LOG_INFO("module.ascension_compat",
-                 "Consumed Ascension missile-position packet payload={} bytes",
-                 packet.size());
+                 "Consumed Ascension missile-position packet payload={} bytes [{}]",
+                 packet.size(), DescribePacketPayload(packet));
       }
 
       return false;
@@ -3613,10 +4213,12 @@ public:
 
     if (ascensionCompatConfig.GetConfigValue<bool>(
             AscensionCompatConfig::LOG_CONSUMED_PACKETS)) {
+      char const *name = ExtensionOpcodeName(uint16(opcode));
       LOG_INFO("module.ascension_compat",
                "Consumed Ascension extension packet opcode=0x{:04X} ({}) "
-               "payload={} bytes",
-               opcode, opcode, packet.size());
+               "payload={} bytes [{}]",
+               opcode, name ? name : "unknown", packet.size(),
+               DescribePacketPayload(packet));
     }
 
     return false;
@@ -3645,8 +4247,151 @@ public:
         {"localcharges", HandleLocalChargesCommand, SEC_PLAYER, Console::No},
         {"spellcharges", spellChargesCommandTable},
         {"localclassrepair", HandleLocalClassRepairCommand, SEC_PLAYER,
-         Console::No}};
+         Console::No},
+        // Protocol work only: send one extension packet by id so the matching
+        // client build can be asked what it does with it.
+        {"extprobe", HandleExtensionProbeCommand, SEC_ADMINISTRATOR,
+         Console::No},
+        // Placement work only: what the bank summon sees under it here.
+        {"bankground", HandleBankGroundCommand, SEC_ADMINISTRATOR, Console::No}};
     return commandTable;
+  }
+
+  static uint32 HexNibble(char c) {
+    if (c >= '0' && c <= '9')
+      return uint32(c - '0');
+    if (c >= 'a' && c <= 'f')
+      return uint32(c - 'a' + 10);
+    if (c >= 'A' && c <= 'F')
+      return uint32(c - 'A' + 10);
+    return 0xFFFFFFFFu;
+  }
+
+  /// "0x0769", "0769" or a name from ExtensionOpcodeName's table.
+  static bool ParseExtensionOpcode(std::string const &text, uint32 &opcode) {
+    std::string body = text;
+    if (body.rfind("0x", 0) == 0 || body.rfind("0X", 0) == 0)
+      body = body.substr(2);
+
+    bool allHex = !body.empty();
+    for (char c : body)
+      if (HexNibble(c) == 0xFFFFFFFFu)
+      {
+        allHex = false;
+        break;
+      }
+    if (allHex)
+    {
+      opcode = 0;
+      for (char c : body)
+        opcode = (opcode << 4) | HexNibble(c);
+      return true;
+    }
+
+    for (ExtensionOpcodeIdentity const &entry : EXTENSION_OPCODES)
+      if (text == entry.Name)
+      {
+        opcode = entry.Opcode;
+        return true;
+      }
+    return false;
+  }
+
+  /// "01 00 00" or "010000" -> {1, 0, 0}.
+  static bool ParseHexBytes(std::string const &text, std::vector<uint8> &out) {
+    std::string digits;
+    for (char c : text) {
+      if (c == ' ' || c == ',' || c == '\t')
+        continue;
+      if (HexNibble(c) == 0xFFFFFFFFu)
+        return false;
+      digits += c;
+    }
+    if (digits.empty() || digits.size() % 2 != 0)
+      return false;
+
+    for (std::size_t i = 0; i < digits.size(); i += 2)
+      out.push_back(uint8((HexNibble(digits[i]) << 4) | HexNibble(digits[i + 1])));
+    return true;
+  }
+
+  static bool HandleExtensionProbeCommand(ChatHandler *handler,
+                                          std::string opcodeText,
+                                          Optional<std::string> payloadText) {
+    Player *player = handler->GetPlayer();
+    if (!player)
+      return false;
+
+    uint32 opcode = 0;
+    if (!ParseExtensionOpcode(opcodeText, opcode) || opcode > 0xFFFF)
+    {
+      handler->PSendSysMessage(
+          "Unknown opcode '{}'. Give a hex id such as 0x0769, or one of the "
+          "names this module knows.",
+          std::string(opcodeText));
+      return true;
+    }
+
+    std::vector<uint8> payload;
+    if (payloadText && !ParseHexBytes(*payloadText, payload))
+    {
+      handler->PSendSysMessage(
+          "Payload must be whole hex bytes, for example \"01 00\".");
+      return true;
+    }
+
+    WorldPacket packet{static_cast<uint16>(opcode)};
+    for (uint8 byte : payload)
+      packet << byte;
+
+    player->GetSession()->SendPacket(&packet);
+
+    char const *name = ExtensionOpcodeName(uint16(opcode));
+    std::string label = name ? std::string(" (") + name + ")" : std::string();
+    handler->PSendSysMessage("Sent 0x{:04X}{} with {} payload bytes.",
+                             opcode, label, uint32(packet.size()));
+    LOG_INFO("module.ascension_compat",
+             "Sent extension packet opcode=0x{:04X} ({}) payload={} bytes [{}] "
+             "to {}",
+             opcode, name ? name : "unknown", packet.size(),
+             DescribePacketPayload(packet), player->GetName());
+    return true;
+  }
+
+  /// Reports every height the bank summon's grounding looks at, so a spot that
+  /// places the bank wrong can be measured instead of guessed at.
+  static bool HandleBankGroundCommand(ChatHandler *handler) {
+    Player *player = handler->GetPlayer();
+    if (!player)
+      return false;
+
+    float x, y, z;
+    player->GetClosePoint(x, y, z, player->GetCombatReach(), 2.0f);
+    float const feetZ = player->GetPositionZ();
+    Map *map = player->GetMap();
+
+    handler->PSendSysMessage("feet {:.2f} on map {} at {:.2f} {:.2f}", feetZ,
+                             player->GetMapId(), player->GetPositionX(),
+                             player->GetPositionY());
+    handler->PSendSysMessage("spot {:.2f} {:.2f} (2 yards {:.2f} rad ahead)", x,
+                             y, player->GetOrientation());
+    for (float start : {feetZ + 0.3f, feetZ + 2.5f, feetZ + 10.0f}) {
+      handler->PSendSysMessage(
+          "  probe from {:.2f}: terrain {:.2f} | terrain+vmap {:.2f}", start,
+          map->GetHeight(x, y, start, false, 3.0f),
+          map->GetHeight(x, y, start, true, 3.0f));
+    }
+    handler->PSendSysMessage("  summon would ground at {:.2f} (riser {:.2f})",
+                             GroundHeightBeneath(map, x, y, feetZ),
+                             GroundHeightBeneath(map, x, y, feetZ) - feetZ);
+    LOG_INFO("module.ascension_compat",
+             "Bank ground probe for {}: feet {:.2f}, spot {:.2f} {:.2f}, "
+             "terrain {:.2f}, terrain+vmap {:.2f}, chosen {:.2f}",
+             player->GetName(), feetZ, x, y,
+             map->GetHeight(x, y, feetZ + 0.3f, false, 3.0f),
+             map->GetHeight(x, y, feetZ + 0.3f, true, 3.0f),
+             GroundHeightBeneath(map, x, y, feetZ));
+    return true;
   }
 
   static bool HandleLocalAppearanceCommand(ChatHandler *handler,
@@ -3939,7 +4684,10 @@ public:
     void OnPlayerSendInitialPacketsBeforeAddToMap(Player* player, WorldPacket& /*data*/) override
     {
         if (ascensionCompatConfig.GetConfigValue<bool>(AscensionCompatConfig::ENABLED))
+        {
             AscensionCollectionService::Instance().PrepareOwnedCompanionsBeforeMap(player);
+            AscensionCollectionService::Instance().PrepareOwnedBankSpellsBeforeMap(player);
+        }
     }
 
   bool OnPlayerCreateInitialItems(Player* player, bool& handled) override
@@ -4868,6 +5616,7 @@ bool IsAscensionPrimalistWeaponsEligible(Player const* player, bool allowUnconfi
 
 void AddAscensionCompatScripts() {
   new npc_ascension_training_book();
+  RegisterSpellScript(spell_ascension_personal_bank);
   RegisterSpellScript(spell_ascension_experience_potion);
   RegisterSpellScript(spell_ascension_local_mount);
   RegisterSpellScript(spell_ascension_legacy_quest_reward);
