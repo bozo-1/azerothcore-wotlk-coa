@@ -126,3 +126,4 @@ __pycache__/
 #
 # ==================
 !/modules/mod-ascension-compat/
+!/modules/mod-teleport-actionbar/
