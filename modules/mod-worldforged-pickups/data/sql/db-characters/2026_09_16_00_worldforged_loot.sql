@@ -1,17 +1,17 @@
 -- ----------------------------------------------------------------------------
--- Worldforged pickups: the per-character loot ledger
+-- Worldforged pickup ledger (companion to worldforged-pickups.sql)
 -- ----------------------------------------------------------------------------
 -- One row per (character, pickup spawn) the character has already looted. The pickup
 -- itself stays in the world for everyone else; this is what makes it inert for the
 -- character who took its item, permanently, across restarts.
 --
 -- Keyed on the spawn id (`gameobject`.`guid`), never on the runtime object GUID: this
--- core hands out map-local generated GUIDs (Map::GenerateLowGuid), so a runtime GUID is
--- not the database row and is not stable across grid reloads. The spawn ids used by this
--- layer are the fixed block 6900001+ written by Database/Custom/worldforged-pickups.sql.
+-- core hands out map-local generated GUIDs, so a runtime GUID is not the database row
+-- and is not stable across grid reloads. The spawn ids used by this layer are the
+-- fixed block 6900001+ written by worldforged-pickups.sql.
 --
--- This repack has Updates.EnableDatabases = 0, so this file is applied by hand, exactly
--- like the world side. It is kept here as the module's own copy of the same statements.
+-- Apply to acore_characters. The module `mod-worldforged-pickups` reads and writes it;
+-- `Updates.EnableDatabases = 0` in this repack, so apply it by hand.
 -- ----------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS `character_worldforged_loot` (
