@@ -37,9 +37,21 @@ catalog's own row, and every position is an observed position.
   (as on the realm) but is given `GO_FLAG_LOCKED | GO_FLAG_NOT_SELECTABLE`, so it cannot be
   opened again. Every other character still sees it sparkling and lootable.
 * **Recording**: `OnPlayerLootItem` fires the moment a base item leaves the pickup, so
-  clicked, auto-stored and group-window loot are all covered.
-* **Two server-side refusals**, because a client can always ask anyway: `GossipHello` refuses
-  the use, and `OnStateChanged` opens nothing (and clears a spent loot the player left open).
+  clicked, auto-stored and group-window loot are all covered. The item and the ledger row are
+  written in one character-database transaction, so a crash cannot mark a pickup spent
+  without the item it was spent for.
+* **`OnAllowedForPlayerLootCheck` refuses the item itself** for a character who has already
+  looted this pickup. This is the one that closes the remaining hole: a loot session that
+  outlives its claim. The chest holds a single shared loot, so the next character's open
+  re-rolls it under the first character's still-open window, and `Player::StoreLootItem`
+  would otherwise hand over a second copy to whoever clicks the slot first. Note that the
+  core's hook reads backwards: `ScriptMgrMacros.h` treats a script returning `true` as a
+  refusal, so true is what withholds the item.
+* **Four server-side refusals in total**, because a client can always ask anyway:
+  `BuildClientFlags` (what this viewer is shown), `GossipHello` (whether the use opens
+  anything - `GameObject::Use` returns before `SendLoot`), the loot-slot check above (whether
+  the item may be handed over), and `OnStateChanged` (which opens nothing, and clears a spent
+  loot the player left open).
 
 Identity is the **spawn id** (`gameobject`.`guid`), never the runtime object GUID: this core
 uses map-local generated GUIDs (`Map::GenerateLowGuid`), which are neither the database row
@@ -66,12 +78,16 @@ nor stable across grid reloads. The restoration writes its spawns in the fixed b
    python tools/install_gameobject_display_info.py --client "C:/path/to/CoA/client"
    ```
 
-2. **The SQL applied.** With `Updates.EnableDatabases = 1` the core applies
-   `data/sql/db-world/` and `data/sql/db-characters/` at startup by itself. On a repack that
-   runs with the updater off, apply the two files by hand, exactly as they are:
+2. **The SQL applied.** With `Updates.EnableDatabases = 7` (all three databases) the core
+   applies `data/sql/db-world/` and `data/sql/db-characters/` at startup by itself; use `6`
+   if you want the characters and world databases only. `1` is the auth database alone and
+   would leave both migrations unapplied. On a repack that runs with the updater off, apply
+   the two files by hand, exactly as they are:
    `data/sql/db-world/2026_09_16_00_worldforged_pickups.sql` and
-   `data/sql/db-characters/2026_09_16_00_worldforged_loot.sql`. The first is idempotent - it
-   deletes the rows it owns before writing them - so re-applying it is safe.
+   `data/sql/db-characters/2026_09_16_00_worldforged_loot.sql`. The first is idempotent: the
+   templates and loot rows are written with `REPLACE INTO` (keyed on `entry`, and on
+   `Entry, Item`), and each block of spawns is preceded by a `DELETE` on its own `guid`
+   range - so re-applying it is safe, twice in a row or a hundred times.
 
 ## Verify it went in
 
@@ -79,7 +95,8 @@ Boot log:
 
 * `>> Loaded 98138 Gameobjects` - equal to `SELECT COUNT(*) FROM acore_world.gameobject`, so
   nothing was skipped for a display id
-* 3,783 C++ scripts
+* 3,784 C++ scripts with this module loaded (`GameObjectScript`, `GlobalScript`,
+  `PlayerScript`)
 * no `Script named 'worldforged_pickup' is assigned in the database, but has no code!`
 * no `has an invalid displayId (...)`, and no invalid-rotation warnings
 
@@ -156,6 +173,10 @@ rejects it row by row.
 SOURCE data/sql/manual/worldforged-pickups-revert.sql;
 DROP TABLE IF EXISTS acore_characters.character_worldforged_loot;
 ```
+
+The undo lives under `data/sql/manual/` rather than beside the migration because it *deletes*
+rows from `gameobject_template`, which the repository's SQL lint asks updates never to do.
+Both migration files pass that lint; the undo is the one file that deletes on purpose.
 
 and restore `Data/dbc/backup/GameObjectDisplayInfo.dbc.bak-<stamp>`.
 
