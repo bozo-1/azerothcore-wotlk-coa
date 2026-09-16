@@ -102,6 +102,10 @@ void ApplyContracts(SpellInfo* info)
         info->AttributesEx3 &= ~SPELL_ATTR3_REQUIRES_OFF_HAND_WEAPON;
     if (Heartseeking(info))
         info->Effects[EFFECT_2].TriggerSpell = 807316;
+    // Quickdraw hands its Rage to Darkslayer (Energize) through a DUMMY effect, which is scripted-only
+    // and never runs. Its sibling Darkslayer authors the identical payload as a trigger effect.
+    if (Quickdraw(info) && info->Effects[EFFECT_2].TriggerSpell == 680235)
+        info->Effects[EFFECT_2].Effect = SPELL_EFFECT_TRIGGER_SPELL;
     if (id == 503662)
         info->CasterAuraSpell = 0;
     if (id == 300872)
@@ -225,7 +229,7 @@ void ApplyContracts(SpellInfo* info)
             effect.TriggerSpell = 0;
             effect.TargetA = SpellImplicitTargetInfo(TARGET_UNIT_TARGET_ENEMY);
         }
-    if (Family(info, 2, 8388608) && info->Id != 681177 && info->Id != 681179)
+    if (Desecrate(info))
     {
         info->CasterAuraState = 0;
         info->CasterAuraSpell = 803166;

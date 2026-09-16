@@ -3295,6 +3295,9 @@ bool Player::_addSpell(uint32 spellId, uint8 addSpecMask, bool temporary, bool l
     // xinef: send packet so client can properly recognize this new spell
     // xinef: ignore passive spells and spells with learn effect
     // xinef: send spells with no aura effects (ie dual wield)
+    // This site owns the announcement for a temporary learn that did not come from a skill line, and its
+    // condition mirrors the one Player::removeSpell uses for onlyTemporary. Player::learnSpell must not
+    // announce the same grant again, or the client ends up with more copies than the server ever removes.
     if (IsInWorld() && !isBeingLoaded() && temporary && !learnFromSkill && (!spellInfo->HasAttribute(SpellAttr0(SPELL_ATTR0_PASSIVE | SPELL_ATTR0_DO_NOT_DISPLAY)) || !spellInfo->HasAnyAura()) && !spellInfo->HasEffect(SPELL_EFFECT_LEARN_SPELL))
         SendLearnPacket(spellInfo->Id, true);
 
@@ -3479,7 +3482,11 @@ void Player::learnSpell(uint32 spellId, bool temporary /*= false*/, bool learnFr
         sScriptMgr->OnPlayerLearnSpell(this, spellId);
 
         // pussywizard: a system message "you have learnt spell X (rank Y)"
-        if (IsInWorld())
+        // Player::_addSpell already sent this packet for a temporary learn that did not come from a skill line,
+        // and Player::removeSpell answers such a grant with a single SMSG_REMOVED_SPELL. Announcing it twice
+        // leaves the client one extra copy of the spell per grant/revoke cycle, which both hides the real
+        // spellbook entry behind duplicates and keeps the client believing a revoked spell is still known.
+        if (IsInWorld() && (!temporary || learnFromSkill))
             SendLearnPacket(spellId, true);
     }
 
@@ -3542,6 +3549,20 @@ uint8 Player::GetLearnSpellSpecMask(uint32 spellId) const
     }
 
     return specMask;
+}
+
+void Player::MarkSpellForSave(uint32 spellId)
+{
+    // Player::_addSpell files a grant made while the session is still loading as PLAYERSPELL_UNCHANGED,
+    // because that state otherwise means "already stored in character_spell". A script that grants a spell
+    // inside the login window therefore never reaches the insert in Player::_SaveSpells. Promoting the entry
+    // to PLAYERSPELL_CHANGED makes the next character save write it out. That save is a DELETE + INSERT pair
+    // on the same spell, so calling this for a spell that is already stored is harmless.
+    PlayerSpellMap::iterator itr = m_spells.find(spellId);
+    if (itr == m_spells.end() || itr->second->State != PLAYERSPELL_UNCHANGED)
+        return;
+
+    itr->second->State = PLAYERSPELL_CHANGED;
 }
 
 void Player::removeSpell(uint32 spell_id, uint8 removeSpecMask, bool onlyTemporary)
@@ -8489,16 +8510,23 @@ void Player::SendLoot(ObjectGuid guid, LootType loot_type)
             for (uint8 index = 0; index < count; ++index)
             {
                 uint8 slot, slotType;
-                data >> slot;
-                data.read_skip(5 * sizeof(uint32)); // Native LootItem packet fields
+                uint32 itemId, itemCount;
+                data >> slot >> itemId >> itemCount;
+                data.read_skip(3 * sizeof(uint32)); // Display, random suffix and random property
                 data >> slotType;
                 if (slotType != LOOT_SLOT_TYPE_ALLOW_LOOT && slotType != LOOT_SLOT_TYPE_OWNER)
+                    continue;
+                // Leave what does not fit on the corpse, but keep walking the view instead of
+                // aborting it: the serializer writes quest items after the normal ones, so a
+                // single unstorable drop would otherwise hide every later slot. Testing storage
+                // here also keeps the automatic retry silent, where Player::StoreLootItem would
+                // send an inventory error to the client on every companion tick.
+                ItemPosCountVec dest;
+                if (CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, itemCount) != EQUIP_ERR_OK)
                     continue;
                 sScriptMgr->OnPlayerAfterCreatureLoot(this);
                 InventoryResult result;
                 StoreLootItem(slot, loot, result);
-                if (result != EQUIP_ERR_OK)
-                    break; // Leave uncollected items on the corpse when bags are full.
             }
             WorldPacket money;
             m_session->HandleLootMoneyOpcode(money);

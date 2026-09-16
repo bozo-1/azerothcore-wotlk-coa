@@ -59,7 +59,7 @@ class spell_ascension_travel_permit : public SpellScript
         return CheckTravel(GetCaster()->ToPlayer());
     }
 
-    void OpenMenu(SpellEffIndex)
+    void OpenMenu()
     {
         Player* player = GetCaster()->ToPlayer();
         Item* item = GetCastItem();
@@ -77,7 +77,14 @@ class spell_ascension_travel_permit : public SpellScript
     void Register() override
     {
         OnCheckCast += SpellCheckCastFn(spell_ascension_travel_permit::CheckCast);
-        OnEffectHitTarget += SpellEffectFn(spell_ascension_travel_permit::OpenMenu, EFFECT_0, SPELL_EFFECT_DUMMY);
+        // AfterCast, not an effect handler. 1001088 is an Ascension client spell, so its recorded
+        // effects and implicit targets are not ours to rely on: an effect handler is skipped whenever
+        // the spell's own effect differs from the one it is bound to (the core only logs "did not match
+        // dbc effect data") or the cast resolves no unit target, which leaves the permit starting its
+        // cooldown and opening nothing. AfterCast runs once per cast that actually went through,
+        // whatever the effects are, and only after the cooldown is committed -- a cast rejected by
+        // CheckCast or by the item cooldown never reaches it.
+        AfterCast += SpellCastFn(spell_ascension_travel_permit::OpenMenu);
     }
 };
 

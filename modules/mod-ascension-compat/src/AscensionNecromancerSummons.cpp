@@ -16,6 +16,7 @@
 #include "SpellScript.h"
 #include "TemporarySummon.h"
 #include <algorithm>
+#include <cmath>
 
 namespace AscensionNecromancer
 {
@@ -30,6 +31,41 @@ bool Stationary(uint32 entry)
 bool Ranged(uint32 entry)
 {
     return entry == 50076;
+}
+// A follow point is fixed by its distance and its owner-relative angle, so minions that
+// share both converge on one spot. Spread the army over concentric rings instead: six
+// places on the innermost ring and six more on each ring outwards, which keeps the gap
+// between neighbours roughly even. Slot 0 is the stock guardian spot, so a lone minion
+// keeps behaving exactly like an ordinary pet.
+void Formation(uint32 slot, float& distance, float& angle)
+{
+    uint32 ring = 0;
+    uint32 places = 6;
+    // Life Force caps the army at 48, but cost-free minions bypass that budget, so stop
+    // widening after five rings (90 places) and let any excess share the outermost one.
+    while (slot >= places && ring < 4)
+    {
+        slot -= places;
+        places += 6;
+        ++ring;
+    }
+    distance = PET_FOLLOW_DIST + 2.5f * float(ring);
+    // The per-ring twist keeps an outer minion from standing directly behind an inner one.
+    angle = Position::NormalizeOrientation(PET_FOLLOW_ANGLE + float(ring) * 0.4f +
+                                           float(slot % places) * 2.0f * float(M_PI) / float(places));
+}
+// A minion's slot is its place in the owner's live army, so the ring closes up again
+// whenever one of them dies. Minions() already drops the stationary entries.
+uint32 FormationSlot(Player* player, Creature const* minion)
+{
+    uint32 slot = 0;
+    for (Creature const* other : Minions(player))
+    {
+        if (other == minion)
+            break;
+        ++slot;
+    }
+    return slot;
 }
 uint32 AttackSpell(uint32 entry)
 {
@@ -173,10 +209,20 @@ bool Summon(Player* player, uint32 spell, Unit* target, Position const& position
                     return created;
                 }
                 Position point = position;
-                player->MovePositionToFirstCollision(point, 1.5f + i * 0.5f, float(i) * 2.4f);
+                bool stationary = Stationary(row.creature);
+                // The intra-cast index is 0 for every single-minion Raise, so it cannot
+                // separate minions raised one cast at a time. Take an army-wide slot:
+                // Count() is the number of live mobile minions, i.e. the index this one
+                // is about to occupy, and it self-increments because IsSummonedBy
+                // registers each creature synchronously inside SummonCreature.
+                float distance = 1.5f + i * 0.5f;
+                float angle = float(i) * 2.4f;
+                if (!stationary)
+                    Formation(Count(player), distance, angle);
+                player->MovePositionToFirstCollision(point, distance, angle);
                 // Authored 61 is a non-pet guardian: native controlled-list cleanup and
                 // effect 190 work for the army.
-                auto properties = sSummonPropertiesStore.LookupEntry(Stationary(row.creature) ? 64 : 61);
+                auto properties = sSummonPropertiesStore.LookupEntry(stationary ? 64 : 61);
                 if (!properties)
                     return created;
                 TempSummon* unit = player->GetMap()->SummonCreature(row.creature, point, properties,
@@ -190,6 +236,10 @@ bool Summon(Player* player, uint32 spell, Unit* target, Position const& position
                 }
                 unit->SetTempSummonType(lifetime > 0 ? TEMPSUMMON_TIMED_DESPAWN : TEMPSUMMON_DEAD_DESPAWN);
                 created = true;
+                // CreatureAI::EnterEvadeMode re-follows on GetFollowAngle(), so storing the
+                // slot's angle keeps the army spread after every fight, not just at spawn.
+                if (!stationary && unit->IsGuardian())
+                    static_cast<Minion*>(unit)->SetFollowAngle(angle);
                 unit->GetMotionMaster()->Clear();
                 if (row.creature == 523032)
                 {
@@ -197,12 +247,12 @@ bool Summon(Player* player, uint32 spell, Unit* target, Position const& position
                     unit->MovePositionToFirstCollision(end, 25.0f, 0.0f);
                     unit->GetMotionMaster()->MovePoint(1, end);
                 }
-                else if (Stationary(row.creature))
+                else if (stationary)
                     unit->GetMotionMaster()->MoveIdle();
                 else if (target && player->IsValidAttackTarget(target) && !player->HasAura(500983))
                     unit->AI()->AttackStart(target);
                 else
-                    unit->GetMotionMaster()->MoveFollow(player, 2.0f, float(i) * 2.4f);
+                    unit->GetMotionMaster()->MoveFollow(player, distance, angle);
             }
     Sync(player);
     return created;
@@ -454,8 +504,23 @@ class npc_ascension_necromancer : public ScriptedAI
                             }
                     if (target)
                         AttackStart(target);
-                    else if (!me->IsWithinDistInMap(player, 5.0f))
-                        me->GetMotionMaster()->MoveFollow(player, 2.0f, PET_FOLLOW_ANGLE);
+                    else
+                    {
+                        // One shared PET_FOLLOW_ANGLE sent the whole army to a single point.
+                        // Re-follow on this minion's own slot, and only when that slot moved
+                        // or no follow is running, so the tick does not restart pathing every
+                        // second. GetFollowAngle() carries the angle issued last time.
+                        float distance = PET_FOLLOW_DIST;
+                        float angle = PET_FOLLOW_ANGLE;
+                        Formation(FormationSlot(player, me), distance, angle);
+                        if (std::fabs(me->GetFollowAngle() - angle) > 0.01f ||
+                            me->GetMotionMaster()->GetCurrentMovementGeneratorType() != FOLLOW_MOTION_TYPE)
+                        {
+                            if (me->IsGuardian())
+                                static_cast<Minion*>(me)->SetFollowAngle(angle);
+                            me->GetMotionMaster()->MoveFollow(player, distance, angle);
+                        }
+                    }
                 }
                 if (me->GetEntry() == 50132 && player->HasAura(500730) && me->IsWithinDistInMap(player, 3.0f))
                 {

@@ -407,7 +407,7 @@ class witch_hunter_state : public UnitScript
             uint64(damage) + player->CountPctFromMaxHealth(35) >= player->GetHealth())
         {
             player->AddSpellCooldown(681173, 0, 120000);
-            SummonHounds(player, 3, sSpellMgr->GetSpellInfo(681172)->GetDuration(), attacker);
+            SummonHounds(player, 3, sSpellMgr->GetSpellInfo(681172)->GetDuration(), 681172, attacker);
             Reset(player, 500085);
         }
     }
