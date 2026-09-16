@@ -34,11 +34,26 @@
  *     (GameObjectAI::BuildClientFlags). Every other character still sees it sparkling.
  *   * A pickup the character may still loot sparkles
  *     (GO_DYNFLAG_LO_ACTIVATE | GO_DYNFLAG_LO_SPARKLE), which is how they are found.
- *   * Server-side the same rule is enforced twice, because a client can always ask:
- *     GameObjectAI::GossipHello refuses the use, and OnStateChanged opens nothing. The
- *     state hook also repairs a pickup left GO_ACTIVATED with spent loot (someone closed
- *     the loot window by logging out), which would otherwise show the next character an
- *     empty window instead of their own item.
+ *
+ * Server-side the same rule is enforced in four places, because a client can always ask
+ * again and the four answer different questions:
+ *
+ *   1. GameObjectAI::BuildClientFlags - what this viewer is shown.
+ *   2. GameObjectAI::GossipHello - whether the use opens anything at all. GameObject::Use
+ *      is not even reached for a viewer carrying GO_FLAG_NOT_SELECTABLE.
+ *   3. OnAllowedForPlayerLootCheck (worldforged_pickup_loot_veto below) - whether this
+ *      character may be handed the item, asked per item, at the moment of the award. This
+ *      is the one that closes the door on a loot session that outlived its claim: the
+ *      chest holds one shared Loot, so the next character's open re-rolls it under the
+ *      first character's still-open window, and StoreLootItem would otherwise hand over a
+ *      second copy to whoever clicks the slot first.
+ *   4. GameObjectAI::OnStateChanged - repairs a pickup left GO_ACTIVATED with spent loot
+ *      (someone closed the loot window by logging out), which would otherwise show the
+ *      next character an empty window instead of their own item.
+ *
+ * The award itself and the record of it are one write: the item row, its place in the
+ * inventory and the ledger row go into a single character-database transaction, so a crash
+ * can leave neither rather than a claimed pickup whose item was never saved.
  *
  * Identity: a pickup is recorded by its *spawn id* (the `gameobject`.`guid` row), never by
  * the runtime object GUID. This core hands out map-local generated GUIDs
@@ -47,9 +62,11 @@
  * spawns in a fixed guid block, so the ids are stable across re-imports too.
  */
 
+#include "Bag.h"
 #include "DatabaseEnv.h"
 #include "GameObject.h"
 #include "GameObjectAI.h"
+#include "GlobalScript.h"
 #include "Item.h"
 #include "LootMgr.h"
 #include "Map.h"
@@ -122,17 +139,42 @@ public:
         _looted.erase(characterGuid);
     }
 
-    void Record(uint32 characterGuid, uint32 spawnId, uint32 entry)
+    // The item and the fact that this pickup is now spent for this character are written
+    // together: item_instance, character_inventory and the ledger row commit as one. The
+    // item is still ITEM_NEW here - nothing has written it yet, because it is only flushed
+    // with the next character save - so these are exactly the writes Player::_SaveInventory
+    // would make, moved to the moment of the award. If the transaction fails, the pickup
+    // stays unclaimed and the character can loot it again, which is the survivable outcome;
+    // a ledger row on its own would mark the pickup spent and lose the item instead.
+    void Claim(Player* player, Item* item, uint32 spawnId, uint32 entry)
     {
+        uint32 const characterGuid = player->GetGUID().GetCounter();
+
         {
             std::lock_guard<std::mutex> lock(_mutex);
             if (!_looted[characterGuid].insert(spawnId).second)
                 return;                                     // already known, nothing to write
         }
 
-        CharacterDatabase.Execute(
-            "INSERT IGNORE INTO `{}` (`guid`, `spawn_id`, `entry`) VALUES ({}, {}, {})",
-            WorldforgedLootTable, characterGuid, spawnId, entry);
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+
+        ObjectGuid::LowType bagGuid = 0;
+        if (Bag* container = item->GetContainer())
+            bagGuid = container->GetGUID().GetCounter();
+
+        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_INVENTORY_ITEM);
+        stmt->SetData(0, characterGuid);
+        stmt->SetData(1, bagGuid);
+        stmt->SetData(2, item->GetSlot());
+        stmt->SetData(3, item->GetGUID().GetCounter());
+        trans->Append(stmt);
+
+        item->SaveToDB(trans);                              // item_instance, then ITEM_UNCHANGED
+
+        trans->Append("INSERT IGNORE INTO `{}` (`guid`, `spawn_id`, `entry`) VALUES ({}, {}, {})",
+                      WorldforgedLootTable, characterGuid, spawnId, entry);
+
+        CharacterDatabase.CommitTransaction(trans);
     }
 
 private:
@@ -236,6 +278,34 @@ public:
     }
 };
 
+// The last word on whether a pickup hands over its item, asked once per loot slot at the
+// moment the award is decided. Player::StoreLootItem calls LootItem::AllowedForPlayer for
+// every slot of a request, and everything a client can ask for - a click, an auto-store, a
+// group roll - goes through StoreLootItem, so a character who has spent this pickup cannot
+// be handed it again even while their old loot window is still open.
+//
+// The hook's name reads backwards, so read it with the macro: ScriptMgrMacros.h's
+// CALL_ENABLED_BOOLEAN_HOOKS returns false as soon as any script returns true
+// ("if (action) return false"), and AllowedForPlayer drops the item when that call returns
+// false. Returning true here is therefore what withholds the item, and false is the
+// do-nothing default for every other loot in the game.
+class worldforged_pickup_loot_veto : public GlobalScript
+{
+public:
+    worldforged_pickup_loot_veto() : GlobalScript("worldforged_pickup_loot_veto",
+        {GLOBALHOOK_ON_ALLOWED_FOR_PLAYER_LOOT_CHECK}) { }
+
+    bool OnAllowedForPlayerLootCheck(Player const* player, ObjectGuid source) override
+    {
+        if (!player || !source.IsGameObject())
+            return false;
+
+        GameObject* go = player->GetMap()->GetGameObject(source);
+        return IsWorldforgedPickup(go) &&
+            WorldforgedLootStore::Instance().HasLooted(player->GetGUID().GetCounter(), go->GetSpawnId());
+    }
+};
+
 class worldforged_pickup_lifecycle : public PlayerScript
 {
 public:
@@ -264,8 +334,7 @@ public:
         if (!IsWorldforgedPickup(go))
             return;
 
-        WorldforgedLootStore::Instance().Record(player->GetGUID().GetCounter(), go->GetSpawnId(),
-                                                go->GetEntry());
+        WorldforgedLootStore::Instance().Claim(player, item, go->GetSpawnId(), go->GetEntry());
 
         // Make this client re-read the flags, so the pickup goes inert for this viewer now.
         go->ForceValuesUpdateAtIndex(GAMEOBJECT_FLAGS);
@@ -277,5 +346,6 @@ public:
 void AddWorldforgedPickupsScripts()
 {
     new worldforged_pickup_script();
+    new worldforged_pickup_loot_veto();
     new worldforged_pickup_lifecycle();
 }
