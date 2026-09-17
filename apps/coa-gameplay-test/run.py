@@ -34,9 +34,13 @@ METRICS = {
     'cast_speed_multiplier', 'spell_crit_chance', 'spell_power_cost', 'spell_damage_done', 'melee_damage_done',
     'who_count', 'who_class', 'loot_count', 'loot_entry', 'loot_received',
     'quest_rewarded', 'spell_damage_taken', 'melee_damage_taken',
+    'quest_status', 'quest_takeable', 'dialog_status',
+    'ball_offer_count', 'ball_offers_quest',
+    'ball_carried_count', 'ball_carried_quest', 'ball_turn_in_count', 'ball_turn_in_quest',
+    'gossip_text',
 }
 METRIC_FIELDS = {'actor', 'metric', 'spell', 'power', 'caster', 'effect', 'item', 'entry',
-                 'relative_to', 'ratio_to', 'target', 'quest'}
+                 'relative_to', 'ratio_to', 'target', 'quest', 'id'}
 ACTIONS = {
     'console': ({'command'}, {'command'}),
     'command': ({'actor', 'command'}, {'actor', 'command'}),
@@ -67,6 +71,12 @@ ACTIONS = {
     'set_level': ({'actor', 'value'}, {'actor', 'value'}),
     'set_health': ({'actor', 'value'}, {'actor', 'value'}),
     'set_power': ({'actor', 'value'}, {'actor', 'value', 'power'}),
+    'teleport': ({'actor', 'map', 'x', 'y', 'z'}, {'actor', 'map', 'x', 'y', 'z', 'o'}),
+    'quest_accept': ({'actor', 'quest', 'entry'}, {'actor', 'quest', 'entry'}),
+    'quest_open': ({'actor', 'quest', 'entry'}, {'actor', 'quest', 'entry'}),
+    'quest_click': ({'actor', 'quest', 'entry'}, {'actor', 'quest', 'entry'}),
+    'quest_complete': ({'actor', 'quest'}, {'actor', 'quest'}),
+    'quest_turn_in': ({'actor', 'quest', 'entry'}, {'actor', 'quest', 'entry', 'reward'}),
 }
 
 
@@ -178,11 +188,16 @@ def validate(scenario):
             keys(destination, {'x', 'y', 'z'}, {'x', 'y', 'z'}, f'{where}.destination')
             for key in ('x', 'y', 'z'):
                 number(destination[key], f'{where}.destination.{key}', -17000, 17000)
-        for key in ('spell', 'item', 'talent', 'count', 'entry', 'quest'):
+        if action == 'teleport':
+            number(step['map'], f'{where}.map', 0, 2**31 - 1, True)
+            for key in ('x', 'y', 'z', 'o'):
+                if key in step:
+                    number(step[key], f'{where}.{key}', -17000, 17000)
+        for key in ('spell', 'item', 'talent', 'count', 'entry', 'quest', 'id'):
             if key in step:
                 number(step[key], f'{where}.{key}', 1, 2**31 - 1, True)
         for key, maximum in (('rank', 4), ('effect', 2), ('slot', 18), ('power', 6), ('choice', 5),
-                             ('option', 2**32 - 1)):
+                             ('reward', 5), ('option', 2**32 - 1)):
             if key in step:
                 number(step[key], f'{where}.{key}', 0, maximum, True)
         if 'stacks' in step:
@@ -218,6 +233,16 @@ def validate(scenario):
             if metric == 'owned_creature_count':
                 require('entry' in step, f'{where}: metric needs creature entry')
                 require('caster' not in step or 'spell' in step, f'{where}: aura caster filter needs spell')
+            if metric in {'quest_status', 'quest_takeable'}:
+                require('quest' in step, f'{where}: metric needs quest')
+            if metric == 'dialog_status':
+                require('entry' in step, f'{where}: metric needs creature entry')
+            if metric == 'ball_offers_quest':
+                require('quest' in step, f'{where}: metric needs quest')
+            if metric in {'ball_carried_quest', 'ball_turn_in_quest'}:
+                require('quest' in step, f'{where}: metric needs quest')
+            if metric == 'gossip_text':
+                require('id' in step, f'{where}: metric needs text id')
             if metric in {'knows_spell', 'has_talent', 'talent_points', 'cooldown_ms', 'item_count', 'bank_bag_slots',
                           'pet_entry', 'pet_aura_stacks', 'owned_creature_count', 'charm_entry',
                           'charm_aura_stacks', 'controls_self', 'private_instance',
@@ -225,7 +250,11 @@ def validate(scenario):
                           'cast_speed_multiplier', 'spell_crit_chance', 'spell_power_cost',
                           'spell_damage_done', 'melee_damage_done', 'spell_damage_taken', 'melee_damage_taken',
                           'who_count', 'who_class',
-                          'loot_count', 'loot_entry', 'loot_received', 'quest_rewarded'}:
+                          'loot_count', 'loot_entry', 'loot_received', 'quest_rewarded',
+                          'quest_status', 'quest_takeable', 'dialog_status',
+                          'ball_offer_count', 'ball_offers_quest',
+                          'ball_carried_count', 'ball_carried_quest',
+                          'ball_turn_in_count', 'ball_turn_in_quest'}:
                 require(step['actor'] in player_ids, f'{where}: metric needs a player')
             if 'relative_to' in step:
                 require(snapshots.get(step['relative_to']) == metric, f'{where}: missing or incompatible snapshot')
