@@ -169,6 +169,10 @@ public:
         stmt->SetData(3, item->GetGUID().GetCounter());
         trans->Append(stmt);
 
+        // SaveToDB marks the item ITEM_UNCHANGED but leaves its pointer in the player's update queue.
+        // Any later change (sold, destroyed, stacked) would queue it a second time, and the next
+        // character save would then delete it on the first entry and read freed memory on the second.
+        item->RemoveFromUpdateQueueOf(player);
         item->SaveToDB(trans);                              // item_instance, then ITEM_UNCHANGED
 
         trans->Append("INSERT IGNORE INTO `{}` (`guid`, `spawn_id`, `entry`) VALUES ({}, {}, {})",

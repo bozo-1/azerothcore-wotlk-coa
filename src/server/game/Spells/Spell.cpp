@@ -1856,7 +1856,15 @@ void Spell::SelectImplicitCasterObjectTargets(SpellEffIndex effIndex, SpellImpli
 
 void Spell::SelectImplicitTargetObjectTargets(SpellEffIndex effIndex, SpellImplicitTargetInfo const& targetType)
 {
-    ASSERT((m_targets.GetObjectTarget() || m_targets.GetItemTarget()) && "Spell::SelectImplicitTargetObjectTargets - no explicit object or item target available!");
+    // The explicit target can vanish between a script queuing a triggered cast and the cast
+    // itself (SpellCastTargets::Update no longer finds it on the caster's map). Skip the
+    // effect instead of stopping the whole server on an assertion.
+    if (!m_targets.GetObjectTarget() && !m_targets.GetItemTarget())
+    {
+        LOG_ERROR("spells", "Spell::SelectImplicitTargetObjectTargets - spell {} cast by {} has no explicit object or item target, effect {} skipped",
+            m_spellInfo->Id, m_caster->GetGUID().ToString(), uint32(effIndex));
+        return;
+    }
 
     WorldObject* target = m_targets.GetObjectTarget();
 
@@ -8040,6 +8048,11 @@ bool Spell::UpdatePointers()
     }
     else
         m_CastItem = nullptr;
+
+    // m_weaponItem is taken when the cast starts. A delayed spell can hit after that weapon was unequipped or
+    // destroyed (bots change gear on their own), and the weapon skill update would then read a freed item.
+    if (m_weaponItem)
+        m_weaponItem = m_caster->IsPlayer() ? m_caster->ToPlayer()->GetWeaponForAttack(m_attackType, true) : nullptr;
 
     m_targets.Update(m_caster);
 
