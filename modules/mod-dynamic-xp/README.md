@@ -36,7 +36,8 @@ All keys live in `conf/dynamicxp.conf.dist`:
 - `Dynamic.XP.Preset.PlayerChoice` - `1` (default) lets players choose their own rate,
   `0` restricts the choice to game masters.
 - `Dynamic.XP.Rate` and `Dynamic.XP.Rate.X-X` - the per-band curve, used by preset `0`.
-- `Dynamic.XP.Rate.Announce` - `1` tells each player their rate on login.
+- `Dynamic.XP.Rate.Announce` - `0` (default) stays silent; `1` tells each player their
+  rate on login.
 - `Dynamic.XP.Reminder.Enable` - the realm-wide note about `.xp` (default `1`).
 - `Dynamic.XP.Reminder.Interval` - minutes between reminders (default `40`, `0` disables
   the repeat).

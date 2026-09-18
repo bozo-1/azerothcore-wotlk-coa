@@ -5,8 +5,8 @@
 #        Description: per-level-range XP rates, a rate a player can pick for themselves,
 #                     and a reminder about it.
 #
-#        Dynamic.XP.Rate.Announce: 1 (Enable) Default
-#                                  0 (Disable)
+#        Dynamic.XP.Rate.Announce: 1 (Enable) tells each player their rate on login
+#                                  0 (Disable) Default - the realm-wide reminder covers it
 #
 #        Dynamic.XP.Preset: the realm rate, and the default for every character that has
 #                           not picked one. Read at startup and on ".reload config", so
@@ -32,7 +32,7 @@
 #                               automatic announcements.
 #
 
-Dynamic.XP.Rate.Announce = 1
+Dynamic.XP.Rate.Announce = 0
 
 Dynamic.XP.Preset = 1
 
