@@ -7,6 +7,14 @@
 # Enable the compatibility packet filter.
 AscensionCompat.Enable = 1
 
+# Answer the Character Advancement handshake with the character's stored
+# specialization instead of an empty state. Without it the client is never told
+# which specialization it is on, so its own remembered value is the only one it
+# has - and when that is lost the archetype chooser reopens and the client
+# re-asserts a guess the realm then has to defend the stored build against.
+# Restart to apply.
+AscensionCompat.AnnounceActiveSpec = 1
+
 # Apply the Ascension protocol settings to remote connections as well as loopback
 # (world headers, extension opcodes, ping interval, spell-modifier layout, class-10 mapping).
 # Enable only on realms dedicated to the matching Ascension client build.

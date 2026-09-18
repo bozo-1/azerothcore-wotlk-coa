@@ -59,6 +59,7 @@
 #include "ConfigValueCache.h"
 #include "DatabaseEnv.h"
 #include "DBCStores.h"
+#include "GameTime.h"
 #include "GossipDef.h"
 #include "GlobalScript.h"
 #include "GridTerrainData.h"
@@ -123,6 +124,10 @@ constexpr uint16 SMSG_VANITY_COLLECTION_ADDED = 0x06F8;
 constexpr uint16 SMSG_QUERY_CUSTOM_STORE_RESULT = 0x06BA;
 constexpr std::size_t VANITY_STORE_RECORD_DWORDS = 16;
 constexpr uint16 SMSG_CHARACTER_ADVANCEMENT_AUTHENTICATION = 0x0725;
+// The client sends this once its extension module has registered its handlers,
+// which happens after the login sequence, so it is the first moment an answer to
+// the advancement handshake can actually be received.
+constexpr uint16 CMSG_EXTENSION_INITIALIZED = 0x0561;
 constexpr uint16 CMSG_MISSILE_FIRE_POSITION = 0x09C7;
 
 // The client carries a personal-bank mode on top of the guild vault window. It is
@@ -145,7 +150,7 @@ constexpr ExtensionOpcodeIdentity EXTENSION_OPCODES[] = {
     {CMSG_ANTICHEAT_ALERT, "CMSG_ANTICHEAT_ALERT"},
     {CMSG_VANITY_DELIVERY, "CMSG_VANITY_DELIVERY"},
     {0x053B, "CMSG_ASCENSIONGM_TICKET_LIST_REQUEST"},
-    {0x0561, "CMSG_EXTENSION_INITIALIZED"},
+    {CMSG_EXTENSION_INITIALIZED, "CMSG_EXTENSION_INITIALIZED"},
     {0x05A1, "CMSG_CHALLENGE_QUERY_FAILURE"},
     {0x061B, "CMSG_ITEM_QUERY_BULK"},
     {0x0667, "CMSG_SET_LEVEL_SCALING"},
@@ -236,6 +241,47 @@ constexpr uint32 SPELL_REAPER_HARVEST_TIME = 803995;
 constexpr char ASCENSION_LOCAL_RESOURCE_PREFIX[] = "ASC_LOCAL_RESOURCE";
 constexpr char ASCENSION_ACTIVE_SPEC_SETTING[] = "core.ascension_active_spec";
 
+// Server -> client Character Advancement state, over the addon channel the
+// client already listens on (the same LANG_ADDON whisper ASC_LOCAL_RESOURCE and
+// ASC_LOCAL_ECHOES use). Two facts have no other way to reach the client on this
+// realm, and both are visible in play:
+//
+//  * the specialization the character is actually on. The client's own
+//    advancement backend is absent here, so it concludes that nothing was ever
+//    chosen and reopens the archetype chooser every time its UI loads;
+//  * the committed rank of every stored pick. The client reconstructs a node's
+//    rank from its spellbook, and a hidden (SPELL_ATTR0_HIDDEN_CLIENTSIDE, 0x80)
+//    talent does not come back from that read, so a learned build draws unranked
+//    and the next save refunds it for real.
+constexpr char ASCENSION_LOCAL_SPEC_PREFIX[] = "ASC_LOCAL_SPEC";
+constexpr char ASCENSION_LOCAL_TALENTS_PREFIX[] = "ASC_LOCAL_TALENTS";
+
+// Which trees this realm holds a record for, one flag per tree (class tree,
+// then the active specialization).  The client needs the difference between "no
+// record" and "a record with nothing in it": the first means the spellbook is
+// the only copy and may be read, the second is a build the player cleared - and
+// reading the spellbook there draws whatever the character happens to own, the
+// starter kit this realm re-grants on login included, as talents they chose.
+// That is the preset that used to appear after Reset Trees.
+constexpr char ASCENSION_LOCAL_RECORDS_PREFIX[] = "ASC_LOCAL_RECORDS";
+
+// Persisted Character Advancement builds. This realm has no advancement backend,
+// and the client cannot read a hidden (SPELL_ATTR0_... 0x80) talent's rank, so a
+// specialization switch used to destroy a build's only copy - the live spellbook.
+// A paid/choose-one pick is stored as entryId * 10 + rank (rank 1..3); element 0
+// of the row is the pick count, so a shorter build simply leaves its old tail
+// unread. The class tree is shared by every specialization and stored apart.
+constexpr char ASCENSION_TALENT_BUILD_SETTING_PREFIX[] = "core.ascension_build.";
+constexpr char ASCENSION_CLASS_TREE_SETTING[] = "core.ascension_class_tree";
+constexpr char ASCENSION_TALENT_SLOT_SETTING[] = "core.ascension_slot";
+constexpr uint32 MAX_STORED_TALENT_PICKS = 256;
+// How long this realm's record stands against a client's "unlearned" report for
+// one entry, before a repeat of the same request is taken as intent.
+constexpr int64 REFUSED_UNLEARN_SECONDS = 30;
+// How long the specialization announced at login stands as the realm's answer,
+// rather than something the client may silently contradict on its own.
+constexpr int64 LOGIN_AUTHORITY_SECONDS = 60;
+
 enum CompanionLoot : uint32
 {
     APPEARANCE_CATEGORY_COMPANION_LOOT = 38,
@@ -309,6 +355,7 @@ enum class AscensionCompatConfig {
   MAX_RIDING_FROM_START,
   LEVEL_SCALING,
   QUEST_LEVEL_SCALING,
+  ANNOUNCE_ACTIVE_SPEC,
 
   NUM_CONFIGS,
 };
@@ -322,6 +369,8 @@ public:
   void BuildConfigCache() override {
     SetConfigValue<bool>(AscensionCompatConfig::ENABLED,
                          "AscensionCompat.Enable", true);
+    SetConfigValue<bool>(AscensionCompatConfig::ANNOUNCE_ACTIVE_SPEC,
+                         "AscensionCompat.AnnounceActiveSpec", true);
     SetConfigValue<bool>(AscensionCompatConfig::LOG_CONSUMED_PACKETS,
                          "AscensionCompat.LogConsumedPackets", true);
     SetConfigValue<uint32>(AscensionCompatConfig::FIRST_EXTENSION_OPCODE,
@@ -1235,7 +1284,32 @@ public:
         _activeSpecializations[player->GetGUID().GetCounter()] = specializationId;
     }
 
+    // The realm owns the build: put the stored picks back before anything reads
+    // or reconciles the spellbook, because the previous session - or an earlier
+    // client that could not see hidden talents - may have removed them.
+    if (uint32 const restored = RestoreTalentBuild(player, specializationId))
+      LOG_INFO("module.ascension_compat",
+               "Restored {} stored talent pick(s) for {} (class {}, specialization {})",
+               restored, player->GetName(), uint32(player->getClass()), specializationId);
+
+    RecordLoginAuthority(player, specializationId);
+
     SynchronizeProgression(player);
+
+    // Bootstrap the record only for a tree this storage has never held a record
+    // for: the live spellbook is the only copy of a build that predates it.
+    //
+    // The test is the presence of a record, not the presence of picks. A tree the
+    // player has deliberately emptied still has a record, and re-deriving it from
+    // the spellbook puts back whatever the character owns at that moment - the
+    // starter kit this very hook re-grants a few lines below, an automatic entry,
+    // a spell an earlier build left behind. That was the "preset nobody chose"
+    // that appeared after Reset Trees, and it is the same for every class.
+    if (specializationId && !HasStoredBuildRecord(player, specializationId))
+      HarvestTalentBuild(player, specializationId, false);
+    if (!HasStoredBuildRecord(player, 0))
+      HarvestTalentBuild(player, 0, false);
+
     SynchronizeProficiencies(player);
     RepairStarterKit(player, false);
     SendCharacterAdvancementAuthentication(player);
@@ -1300,22 +1374,423 @@ public:
     }
   }
 
+  /// The slot a character's stored builds were recorded in. This realm keeps one
+  /// slot; the setting is read because earlier builds of the module wrote it.
+  static uint32 GetStoredTalentSlot(Player const *player) {
+    if (PlayerSettingVector const *slot =
+            player->FindPlayerSettings(ASCENSION_TALENT_SLOT_SETTING))
+      if (!slot->empty())
+        return (*slot)[0].value;
+    return 0;
+  }
+
+  /// Answer the Character Advancement handshake with the state this realm holds.
+  ///
+  /// Answering "nothing" is what reopens the archetype chooser: the client's own
+  /// remembered specialization is then the only one it has, and once that is lost
+  /// it concludes nothing was ever chosen and asks again. It is also what leaves
+  /// the client re-asserting a guess the realm then has to defend its builds
+  /// against. Sending the stored value settles the chooser at its source.
   void SendCharacterAdvancementAuthentication(Player *player) {
+    uint32 const slot = GetStoredTalentSlot(player);
+    uint32 spec = GetActiveSpecialization(player);
+    if (!spec)
+      spec = player->GetPlayerSetting(ASCENSION_ACTIVE_SPEC_SETTING, 0).value;
+
     WorldPacket packet(SMSG_CHARACTER_ADVANCEMENT_AUTHENTICATION,
                        sizeof(uint32) * 2);
-    packet << uint32(0) << uint32(0);
+    packet << slot << spec;
     player->GetSession()->SendPacket(&packet);
 
+    // The handshake above is the client's own channel and its meaning is only
+    // as good as the client build; this is the one this realm can prove. It is
+    // sent from every caller - login, the client's "handlers are ready"
+    // message, and each accepted switch - so the client's copy of the realm's
+    // answer stays in step wherever the answer changes.
+    SendClientTalentState(player);
+
     LOG_INFO("module.ascension_compat",
-             "Initialized Character Advancement for {} (class {}, level {})",
+             "Initialized Character Advancement for {} (class {}, level {}) at "
+             "slot {} with specialization {}",
              player->GetName(), uint32(player->getClass()),
-             uint32(player->GetLevel()));
+             uint32(player->GetLevel()), slot, spec);
+  }
+
+  /// One addon-channel message on the prefix the client's compat layer reads.
+  ///
+  /// The GUID overload of BuildChatPacket is used deliberately: the WorldObject
+  /// overload turns a message sent by a GM account into SMSG_GM_MESSAGECHAT,
+  /// which does not reach Lua as CHAT_MSG_ADDON, and an admin debugging this
+  /// would then see it silently do nothing.
+  static void SendAddonMessage(Player *player, std::string const &prefix,
+                               std::string const &body) {
+    if (!player || !player->GetSession())
+      return;
+
+    std::string message = prefix;
+    message += '\t';
+    message += body;
+
+    WorldPacket packet;
+    ChatHandler::BuildChatPacket(packet, CHAT_MSG_WHISPER, LANG_ADDON,
+        player->GetGUID(), player->GetGUID(), message, 0,
+        player->GetName(), player->GetName(), 0, false);
+    player->GetSession()->SendPacket(&packet);
+  }
+
+  /// Tell the client the specialization it is on and the committed rank of
+  /// every stored pick, which is the state it cannot otherwise obtain here.
+  ///
+  /// The picks are the same records a switch harvests, so what the client draws
+  /// and what the realm restores can no longer disagree. Both trees go out: the
+  /// class tree is shared by every specialization.
+  void SendClientTalentState(Player *player) const {
+    if (!IsAscensionCustomClass(player))
+      return;
+
+    uint32 spec = GetActiveSpecialization(player);
+    if (!spec)
+      spec = player->GetPlayerSetting(ASCENSION_ACTIVE_SPEC_SETTING, 0).value;
+
+    SendAddonMessage(player, ASCENSION_LOCAL_SPEC_PREFIX, std::to_string(spec));
+
+    std::string ranks;
+    uint32 count = 0;
+    uint32 highestRank = 0;
+    auto appendPicks = [&](uint32 specializationId) {
+      for (uint32 pick : ReadStoredPicks(player, specializationId)) {
+        uint32 const entryId = pick / 10;
+        uint32 const rank = pick % 10;
+        if (!entryId || !rank)
+          continue;
+        if (!ranks.empty())
+          ranks += ' ';
+        ranks += std::to_string(entryId);
+        ranks += ':';
+        ranks += std::to_string(rank);
+        ++count;
+        highestRank = std::max(highestRank, rank);
+      }
+    };
+    appendPicks(0);
+    if (spec)
+      appendPicks(spec);
+
+    std::string recorded;
+    recorded += HasStoredBuildRecord(player, 0) ? '1' : '0';
+    recorded += ' ';
+    recorded += (spec && HasStoredBuildRecord(player, spec)) ? '1' : '0';
+    SendAddonMessage(player, ASCENSION_LOCAL_RECORDS_PREFIX, recorded);
+
+    SendAddonMessage(player, ASCENSION_LOCAL_TALENTS_PREFIX, ranks);
+
+    LOG_INFO("module.ascension_compat",
+             "Sent Character Advancement state to {}: specialization {}, {} "
+             "stored pick(s), highest rank {}",
+             player->GetName(), spec, count, highestRank);
+  }
+
+  /// The rank this realm's own record holds for an entry, 0 when it holds none.
+  static uint32 StoredRankForEntry(Player const *player,
+                                   AscensionCompatData::CoATalentEntry const &entry) {
+    for (uint32 pick : ReadStoredPicks(player, entry.SpecId))
+      if (pick / 10 == entry.EntryId && pick % 10)
+        return pick % 10;
+    return 0;
+  }
+
+  /// Should this unlearn be refused?
+  ///
+  /// A client that cannot read every rank back out of its own spellbook reports
+  /// "unlearned" for talents the realm still holds, and obeying that deletes them
+  /// permanently - one session of ordinary clicking emptied four stored picks,
+  /// three of them from a build whose only other copy was the spellbook the same
+  /// request was emptying. So the rank the realm holds stands against the first
+  /// such request and says so; a second identical request is insistence and goes
+  /// through, which keeps a real reset possible rather than merely blocked.
+  bool RefuseContradictingUnlearn(
+      Player *player, AscensionCompatData::CoATalentEntry const &entry) {
+    if (!StoredRankForEntry(player, entry))
+      return false;
+
+    uint32 const guid = player->GetGUID().GetCounter();
+    int64 const now = GameTime::GetGameTime().count();
+
+    std::lock_guard<std::mutex> lock(_stateLock);
+    std::unordered_map<uint32, int64> &perEntry = _refusedUnlearns[guid];
+    auto itr = perEntry.find(entry.EntryId);
+    if (itr != perEntry.end() && itr->second > now)
+    {
+      perEntry.erase(itr);
+      return false;
+    }
+
+    perEntry[entry.EntryId] = now + REFUSED_UNLEARN_SECONDS;
+    return true;
   }
 
   uint32 GetActiveSpecialization(Player const *player) const {
     std::lock_guard<std::mutex> lock(_stateLock);
     auto itr = _activeSpecializations.find(player->GetGUID().GetCounter());
     return itr == _activeSpecializations.end() ? 0 : itr->second;
+  }
+
+  // --- Persisted Character Advancement builds -------------------------------
+
+  static std::string TalentTreeSetting(uint32 specializationId) {
+    return specializationId
+               ? std::string(ASCENSION_TALENT_BUILD_SETTING_PREFIX) +
+                     std::to_string(specializationId)
+               : std::string(ASCENSION_CLASS_TREE_SETTING);
+  }
+
+  /// A build written by this storage starts with this marker, so a row can be
+  /// told apart from the bare lists earlier builds of this module left behind.
+  /// Those bare lists are still read: for several characters they are the only
+  /// surviving copy of a build, and ignoring them is what let an empty spellbook
+  /// record itself as "the build" and keep the real one unread.
+  static constexpr uint32 kStoredBuildMarker = 0x434F4154; // 'COAT'
+
+  static void AppendPicks(std::vector<uint32> &picks,
+                          PlayerSettingVector const &values) {
+    for (PlayerSetting const &value : values) {
+      if (!value.value)
+        continue;
+      picks.push_back(value.value);
+      if (picks.size() >= std::size_t(MAX_STORED_TALENT_PICKS))
+        return;
+    }
+  }
+
+  /// The stored picks of one tree, entryId * 10 + rank, in catalog order.
+  ///
+  /// Two layouts are read. This storage writes a marker, a count and the picks.
+  /// An earlier build of the module wrote a bare list, keyed
+  /// "core.ascension_build.<slot>.<spec>" for a specialization and
+  /// "core.ascension_class_tree" for the class tree. The bare list is consulted
+  /// whenever the current layout yields nothing, so a build recorded before this
+  /// storage existed is still the character's own and can be put back.
+  static std::vector<uint32> ReadStoredPicks(Player const *player,
+                                             uint32 specializationId) {
+    std::vector<uint32> picks;
+
+    // Whether the current layout already holds a record for this tree.  It
+    // decides whether the retired layout may be consulted at all: a record that
+    // exists and is empty is a build the player cleared, and falling back to the
+    // older row on top of it resurrects the build they just reset - which is
+    // exactly how "the save put my old build back" happens.
+    bool current = false;
+
+    if (PlayerSettingVector const *values =
+            player->FindPlayerSettings(TalentTreeSetting(specializationId))) {
+      if (!values->empty() && (*values)[0].value == kStoredBuildMarker) {
+        current = true;
+        std::size_t const count =
+            values->size() < 2 ? 0 : std::size_t((*values)[1].value);
+        std::size_t const limit = std::min(values->size(), count + 2);
+        for (std::size_t index = 2; index < limit; ++index)
+          if (uint32 const pick = (*values)[index].value)
+            picks.push_back(pick);
+      } else {
+        AppendPicks(picks, *values);
+        current = !picks.empty();
+      }
+    }
+
+    if (!current && picks.empty() && specializationId) {
+      // The retired layout named the slot a build was recorded in.
+      std::string const legacy =
+          std::string(ASCENSION_TALENT_BUILD_SETTING_PREFIX) +
+          std::to_string(GetStoredTalentSlot(player)) + "." +
+          std::to_string(specializationId);
+      if (PlayerSettingVector const *values = player->FindPlayerSettings(legacy))
+        AppendPicks(picks, *values);
+    }
+
+    return picks;
+  }
+
+  static void WriteStoredPicks(Player *player, uint32 specializationId,
+                               std::vector<uint32> const &picks) {
+    std::string const setting = TalentTreeSetting(specializationId);
+    std::size_t const count =
+        std::min<std::size_t>(picks.size(), MAX_STORED_TALENT_PICKS);
+    player->UpdatePlayerSetting(setting, 0, kStoredBuildMarker);
+    player->UpdatePlayerSetting(setting, 1, uint32(count));
+    for (std::size_t index = 0; index < count; ++index)
+      player->UpdatePlayerSetting(setting, uint32(index) + 2, picks[index]);
+  }
+
+  /// Live rank of every chosen pick of one tree, as entryId * 10 + rank.
+  /// Automatic progression entries are re-granted by SynchronizeProgression and
+  /// are not the player's picks, so only paid or choose-one entries are kept.
+  static std::vector<uint32> CollectLivePicks(Player const *player,
+                                              uint32 specializationId) {
+    std::vector<uint32> picks;
+    for (AscensionCompatData::CoATalentEntry const &entry :
+         AscensionCompatData::CoATalentEntries) {
+      if (entry.ClassId != player->getClass() ||
+          uint32(entry.SpecId) != specializationId ||
+          (!entry.AECost && !entry.TECost &&
+           !GetSelectableFreeGroup(entry.EntryId)))
+        continue;
+
+      for (uint32 rank = entry.SpellCount; rank > 0; --rank)
+        if (entry.SpellIds[rank - 1] &&
+            player->HasSpell(entry.SpellIds[rank - 1])) {
+          picks.push_back(entry.EntryId * 10 + rank);
+          break;
+        }
+    }
+    return picks;
+  }
+
+  bool HasStoredBuild(Player const *player, uint32 specializationId) const {
+    return !ReadStoredPicks(player, specializationId).empty();
+  }
+
+  /// Whether this storage has ever held a record for this tree, picks or not.
+  ///
+  /// Distinct from HasStoredBuild on purpose: a tree the player has emptied has
+  /// a record - an empty one - and that is a decision, not an absence.
+  static bool HasStoredBuildRecord(Player const *player,
+                                   uint32 specializationId) {
+    return player->FindPlayerSettings(TalentTreeSetting(specializationId)) !=
+           nullptr;
+  }
+
+  /// Record one tree's live picks. An empty harvest never overwrites a stored
+  /// build unless the loss was deliberate (allowEmpty): a spellbook already
+  /// gutted by an earlier switch must not be able to erase the record.
+  uint32 HarvestTalentBuild(Player *player, uint32 specializationId,
+                            bool allowEmpty) {
+    if (!IsAscensionCustomClass(player))
+      return 0;
+
+    std::vector<uint32> const picks = CollectLivePicks(player, specializationId);
+
+    // An empty harvest never creates a record and never empties one. The
+    // spellbook is a copy, and a copy that shows nothing is not evidence that the
+    // player chose nothing - it is equally what a reset, a spec switch or an
+    // unreadable hidden talent looks like. Only a deliberate edit may record
+    // nothing, and that path does not come through here.
+    if (picks.empty() && !allowEmpty)
+      return 0;
+
+    WriteStoredPicks(player, specializationId, picks);
+    return uint32(picks.size());
+  }
+
+  /// Record one deliberate edit in the stored build for its own tree.
+  ///
+  /// The record is the player's decisions, applied one at a time.  Harvesting
+  /// the live spellbook here - which is what an edit used to do - folds in
+  /// whatever the character happens to own: an automatic entry, a spell another
+  /// specialization left behind, a starter grant.  The record then describes a
+  /// build nobody chose, and because the state push reports that record, the
+  /// client draws it: save once and a tree comes back full of talents the player
+  /// never picked.
+  void RecordTalentEdit(Player *player, uint32 specializationId, uint32 entryId,
+                        uint32 rank) {
+    if (!IsAscensionCustomClass(player) || !entryId)
+      return;
+
+    std::vector<uint32> const stored = ReadStoredPicks(player, specializationId);
+
+    std::vector<uint32> edited;
+    edited.reserve(stored.size() + 1);
+    for (uint32 pick : stored)
+      if (pick / 10 != entryId)
+        edited.push_back(pick);
+
+    if (rank)
+      edited.push_back(entryId * 10 + rank);
+
+    WriteStoredPicks(player, specializationId, edited);
+  }
+
+  /// Learn a stored tree again. This only ever learns, never removes, so it is
+  /// safe on every login and on entering a specialization.
+  uint32 ApplyStoredTalentPicks(Player *player, uint32 specializationId) {
+    if (!IsAscensionCustomClass(player))
+      return 0;
+
+    uint32 learned = 0;
+    for (uint32 pick : ReadStoredPicks(player, specializationId)) {
+      uint32 const entryId = pick / 10;
+      uint32 const rank = pick % 10;
+      auto const &entries = AscensionCompatData::CoATalentEntries;
+      auto itr = std::lower_bound(entries.begin(), entries.end(), entryId,
+          [](AscensionCompatData::CoATalentEntry const &entry, uint32 id) {
+            return entry.EntryId < id;
+          });
+      if (itr == entries.end() || itr->EntryId != entryId ||
+          itr->ClassId != player->getClass() ||
+          uint32(itr->SpecId) != specializationId || !rank ||
+          rank > itr->SpellCount)
+        continue;
+
+      uint32 const spellId = itr->SpellIds[rank - 1];
+      if (spellId && !player->HasSpell(spellId) &&
+          sSpellMgr->GetSpellInfo(spellId)) {
+        player->learnSpell(spellId, false);
+        ++learned;
+      }
+    }
+    return learned;
+  }
+
+  /// Everything a login or a switch restores: the specialization's own tree and
+  /// the class tree every specialization shares.
+  uint32 RestoreTalentBuild(Player *player, uint32 specializationId) {
+    uint32 learned = ApplyStoredTalentPicks(player, 0);
+    if (specializationId)
+      learned += ApplyStoredTalentPicks(player, specializationId);
+    return learned;
+  }
+
+  /// Remember the specialization announced at login, and for how long the realm
+  /// answers for it rather than the client guessing.
+  void RecordLoginAuthority(Player *player, uint32 specializationId) {
+    std::lock_guard<std::mutex> lock(_stateLock);
+    LoginArchetypeAuthority &authority =
+        _loginAuthorities[player->GetGUID().GetCounter()];
+    authority.Spec = specializationId;
+    authority.ExpiresAt =
+        GameTime::GetGameTime().count() + LOGIN_AUTHORITY_SECONDS;
+    authority.Questioned = false;
+  }
+
+  /// The client re-sends its remembered specialization on every login because
+  /// this realm never tells it what it is on. Such an assertion must not move a
+  /// built character onto a specialization that has no stored build. The first
+  /// such request inside the login window is refused and explained; asking
+  /// again is insistence and is honoured.
+  bool AcceptClientSpecializationRequest(Player *player,
+                                         uint32 specializationId) {
+    std::lock_guard<std::mutex> lock(_stateLock);
+    auto itr = _loginAuthorities.find(player->GetGUID().GetCounter());
+    if (itr == _loginAuthorities.end())
+      return true;
+
+    LoginArchetypeAuthority &authority = itr->second;
+    if (authority.Questioned || !authority.Spec ||
+        authority.Spec == specializationId ||
+        GameTime::GetGameTime().count() >= authority.ExpiresAt)
+      return true;
+
+    // Only a move that would leave a recorded build behind is questioned.
+    if (ReadStoredPicks(player, authority.Spec).empty() ||
+        !ReadStoredPicks(player, specializationId).empty())
+      return true;
+
+    authority.Questioned = true;
+    return false;
+  }
+
+  void ForgetLoginAuthority(Player *player) {
+    std::lock_guard<std::mutex> lock(_stateLock);
+    _loginAuthorities.erase(player->GetGUID().GetCounter());
   }
 
   bool SwitchSpecialization(Player *player, uint32 specializationId) {
@@ -1333,6 +1808,10 @@ public:
     if (!validSpecialization)
       return false;
 
+    // An accepted switch ends the login window: the realm now answers for the
+    // specialization it just entered.
+    ForgetLoginAuthority(player);
+
     uint32 const previousSpecialization = GetActiveSpecialization(player);
     if (!previousSpecialization || previousSpecialization == specializationId)
     {
@@ -1342,14 +1821,24 @@ public:
       }
       player->UpdatePlayerSetting(ASCENSION_ACTIVE_SPEC_SETTING, 0, specializationId);
 
+      // Entering a specialization always means its stored build.
+      RestoreTalentBuild(player, specializationId);
+
       uint32 granted = SynchronizeProgression(player);
       LOG_INFO("module.ascension_compat",
                "Synchronized {} (class {}) with local specialization {} and "
                "granted {} missing automatic spells",
                player->GetName(), uint32(player->getClass()), specializationId,
                granted);
+      // Keep the client's own answer in step with the realm's.
+      SendCharacterAdvancementAuthentication(player);
       return true;
     }
+
+    // Record what the character is leaving before the spellbook is touched: a
+    // stored pick survives the removal below, the live spellbook does not.
+    HarvestTalentBuild(player, previousSpecialization, false);
+    HarvestTalentBuild(player, 0, false);
 
     // Like Player::ActivateSpec, dismiss the pet summoned under the old specialization.
     if (Pet* pet = player->GetPet())
@@ -1378,18 +1867,22 @@ public:
     }
     player->UpdatePlayerSetting(ASCENSION_ACTIVE_SPEC_SETTING, 0, specializationId);
 
+    uint32 const restored = RestoreTalentBuild(player, specializationId);
     uint32 granted = SynchronizeProgression(player);
     ChatHandler(player->GetSession())
         .PSendSysMessage(
             "Activated specialization {}. Refunded all CoA talent points, "
-            "removed {} old talent spell(s), and granted {} automatic "
-            "ability/passive spell(s).",
-            specializationId, removed, granted);
+            "removed {} old talent spell(s), restored {} stored pick(s), and "
+            "granted {} automatic ability/passive spell(s).",
+            specializationId, removed, restored, granted);
     LOG_INFO("module.ascension_compat",
              "Switched {} (class {}) to local specialization {}: removed "
-             "{} CoA spells and granted {} automatic spells",
+             "{} CoA spells, restored {} stored picks and granted {} automatic "
+             "spells",
              player->GetName(), uint32(player->getClass()), specializationId,
-             removed, granted);
+             removed, restored, granted);
+    // Keep the client's own answer in step with the realm's.
+    SendCharacterAdvancementAuthentication(player);
     return true;
   }
 
@@ -1417,6 +1910,7 @@ public:
     _tuningUpdates.erase(player->GetGUID());
     _activeSpecializations.erase(player->GetGUID().GetCounter());
     _proficiencySynchronizations.erase(player->GetGUID().GetCounter());
+    _loginAuthorities.erase(player->GetGUID().GetCounter());
   }
 
     static uint32 GetSelectableFreeGroup(uint32 entryId)
@@ -1538,12 +2032,26 @@ private:
         return learned;
     }
 
+  // The specialization the realm announced at login, and how long it stands. A
+  // client that re-sends its own remembered value must not be able to move a
+  // built character onto a specialization with no build while this window is open.
+  struct LoginArchetypeAuthority
+  {
+    uint32 Spec = 0;
+    int64 ExpiresAt = 0;
+    bool Questioned = false;
+  };
+
   // One service for every player, and player updates run on several map threads at once: every
-  // access to the three containers below goes through this lock. Without it a concurrent insert
+  // access to the containers below goes through this lock. Without it a concurrent insert
   // corrupts the hash table and a later lookup loops forever, which stops the whole world.
   mutable std::mutex _stateLock;
   std::unordered_map<ObjectGuid, uint32> _tuningUpdates;
   std::unordered_map<uint32, uint32> _activeSpecializations;
+  std::unordered_map<uint32, LoginArchetypeAuthority> _loginAuthorities;
+  /// Per character, the entry ids whose unlearn this realm already refused, and
+  /// when that refusal lapses. See RefuseContradictingUnlearn.
+  std::unordered_map<uint32, std::unordered_map<uint32, int64>> _refusedUnlearns;
   std::unordered_set<uint32> _proficiencySynchronizations;
 };
 
@@ -4312,6 +4820,18 @@ public:
     if (opcode == CMSG_ANTICHEAT_ALERT)
       return true;
 
+    // The client's extension module registers its handlers while it starts up,
+    // after the login sequence, so an earlier announcement was dropped. This is
+    // the client saying it is listening now.
+    if (opcode == CMSG_EXTENSION_INITIALIZED)
+    {
+      if (ascensionCompatConfig.GetConfigValue<bool>(
+              AscensionCompatConfig::ANNOUNCE_ACTIVE_SPEC))
+        if (Player *player = session ? session->GetPlayer() : nullptr)
+          AscensionClassService::Instance().SendCharacterAdvancementAuthentication(player);
+      return false;
+    }
+
     if (opcode == CMSG_CREATURE_ASSET_QUERY_MULTIPLE)
     {
         constexpr uint32 maxCreatureQueries = 256;
@@ -4413,6 +4933,8 @@ public:
         {"localvanity", HandleLocalVanityCommand, SEC_PLAYER, Console::No},
         {"localtalent", HandleLocalTalentCommand, SEC_PLAYER, Console::No},
         {"localspec", HandleLocalSpecCommand, SEC_PLAYER, Console::No},
+        {"localspecstate", HandleLocalSpecStateCommand, SEC_PLAYER,
+         Console::No},
         {"localresource", HandleLocalResourceCommand, SEC_PLAYER,
          Console::No},
         {"localcharges", HandleLocalChargesCommand, SEC_PLAYER, Console::No},
@@ -4686,6 +5208,24 @@ public:
                         player->removeSpell(spellId, SPEC_MASK_ALL, false);
     }
 
+    // A rank 0 for an entry the realm holds is obeyed.
+    //
+    // This handler used to refuse the first such request and ask again, on the
+    // grounds that a client which cannot read a hidden talent's rank reports
+    // "unlearned" for things the realm still holds. That protection now lives
+    // where intent is actually known: the compat layer marks the entries the
+    // player has deliberately changed, applies the realm's record as a floor
+    // only to the ones they have not, and so never sends a contradictory zero
+    // by accident. Refusing here instead fought the player - a tree reset is one
+    // such zero per entry and there is no second request to give, so every
+    // reset and every pick made after it was silently discarded.
+    if (!rank)
+      LOG_INFO("module.ascension_compat",
+               "Removing CoA talent entry {} for {} at the client's request "
+               "(realm record held rank {})",
+               entryId, player->GetName(),
+               AscensionClassService::StoredRankForEntry(player, *itr));
+
     for (uint32 spellId : itr->SpellIds) {
       if (spellId && player->HasSpell(spellId))
         player->removeSpell(spellId, SPEC_MASK_ALL, false);
@@ -4693,6 +5233,13 @@ public:
 
     if (rank > 0)
         player->learnSpell(selectedSpellId, false);
+
+    // Keep the stored build in step with this edit, and only with this edit: an
+    // explicit rank 0 is intent, and re-deriving the whole tree from the
+    // spellbook here would replace the player's build with whatever the
+    // character happens to own.
+    AscensionClassService::Instance().RecordTalentEdit(player, itr->SpecId, entryId,
+                                                       rank);
 
     AscensionClassService::Instance().SynchronizeProgression(player);
 
@@ -4708,11 +5255,40 @@ public:
     if (!player)
       return false;
 
+    // The client re-asserts its remembered specialization on every login. Let
+    // the realm's own answer win over that first guess, instead of letting it
+    // refund a build the client only failed to read.
+    if (!AscensionClassService::Instance().AcceptClientSpecializationRequest(
+            player, specializationId))
+    {
+      uint32 const kept =
+          AscensionClassService::Instance().GetActiveSpecialization(player);
+      AscensionClassService::Instance().RestoreTalentBuild(player, kept);
+      handler->PSendSysMessage(
+          "Kept specialization {} and restored its build: {} was requested with "
+          "no stored build for it. Ask again to move there and start it empty.",
+          kept, specializationId);
+      return true;
+    }
+
     if (!AscensionClassService::Instance().SwitchSpecialization(
             player, specializationId))
       handler->PSendSysMessage(
           "Specialization {} is not valid for your custom class.",
           specializationId);
+    return true;
+  }
+
+  /// Answer the client's request for the advancement state it cannot obtain
+  /// here. The compat layer asks for it while loading, which is later than
+  /// login: the add-on that carries it is load-on-demand, so the login-time
+  /// push has no listener yet and is dropped.
+  static bool HandleLocalSpecStateCommand(ChatHandler *handler) {
+    Player *player = handler->GetPlayer();
+    if (!player)
+      return false;
+
+    AscensionClassService::Instance().SendClientTalentState(player);
     return true;
   }
 
@@ -6080,6 +6656,9 @@ bool SetAscensionTalentRank(Player* player, uint32 entryId, uint32 rank)
 
     if (rank > 0)
         player->learnSpell(selectedSpellId, false);
+
+    // Same deliberate-edit sync as ".localtalent": this API is a real change.
+    AscensionClassService::Instance().HarvestTalentBuild(player, entry->SpecId, true);
 
     AscensionClassService::Instance().SynchronizeProgression(player);
     return true;
