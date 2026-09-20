@@ -63,10 +63,13 @@ The models ship in the client, so once the rows exist the objects render:
 
 ## What the module does at runtime
 
-* `PortableMail.VerifyOnStartup` (default on) - one check at startup that each object is present
-  with the expected type, model and size, and that its spell lives as long as the gadget says it
-  does; an error names the row when either drifts, so a wiped table or a stray duration cannot
-  silently break the gadgets again. The same list is logged with each gadget's lifetime.
+* `PortableMail.VerifyOnStartup` (default on) - one check at startup that each listed item casts
+  its spell on use, the spell summons the expected object with the expected lifetime, and the
+  object has the expected type, model and size. Both portals must cast teleport spell 979612 on
+  click, and that spell must exist in the server's spell data. An error names the broken link;
+  an unrelated object row or a portal without a click spell cannot make the check pass.
+  The same list is logged with each gadget's lifetime. These are data checks: they do not
+  validate the altars' client enchanting feature.
 * `.portablemail status` (GM, also from the console) - the same list on demand.
 
 The module never creates or grants items. On CoA the post tube was handed out by the onboarding

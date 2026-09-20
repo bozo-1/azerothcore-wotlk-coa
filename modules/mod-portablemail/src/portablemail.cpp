@@ -42,6 +42,11 @@ using namespace Acore::ChatCommands;
 
 namespace
 {
+enum PortableMailSpells : uint32
+{
+    SPELL_TRANSPOLYPORTER_TELEPORT = 979612
+};
+
 // One portable gadget: the object its spell spawns, what that object should be, and the item and
 // spell that lead to it. `objectLifetimeMs` is how long the object is meant to stand, which the
 // spell takes from its DurationIndex via SpellDuration.dbc.
@@ -64,9 +69,11 @@ struct PortableGadget
 constexpr std::array<PortableGadget, 4> PortableGadgets =
 {{
     { 1903511, GAMEOBJECT_TYPE_MAILBOX,      12003,  0.75f, 1903512, 985210, 180000, "Gnomish Portable Post Tube" },
-    { 1903510, GAMEOBJECT_TYPE_SPELLCASTER,   2047,  1.00f, 1903510, 979611,  30000, "Gnomish Portable Transpolyporter" },
+    { 1903510, GAMEOBJECT_TYPE_SPELLCASTER,   2047,  1.00f, 1903510, 979611,  30000,
+        "Gnomish Portable Transpolyporter" },
     { 1903512, GAMEOBJECT_TYPE_BINDER,      12004,  0.50f, 1903513, 985211, 300000, "Portable Mystic Altar" },
-    { 1903520, GAMEOBJECT_TYPE_SPELLCASTER, 138000,  1.00f, 1903515, 979411,  30000, "Demonic Portable Transpolyporter" },
+    { 1903520, GAMEOBJECT_TYPE_SPELLCASTER, 138000,  1.00f, 1903515, 979411,  30000,
+        "Demonic Portable Transpolyporter" },
 }};
 
 // Spell durations are milliseconds, and -1 means "until cancelled".
@@ -98,24 +105,56 @@ std::vector<std::string> GadgetProblems(PortableGadget const& gadget)
     ItemTemplate const* item = sObjectMgr->GetItemTemplate(gadget.itemEntry);
     if (!item)
         problems.push_back("no row in item_template");
-    else if (item->Spells[0].SpellId != int32(gadget.spellId))
-        problems.push_back("item spells " + std::to_string(item->Spells[0].SpellId) + ", expected " + std::to_string(gadget.spellId));
+    else
+    {
+        if (item->Spells[0].SpellId != int32(gadget.spellId))
+            problems.push_back("item spells " + std::to_string(item->Spells[0].SpellId) + ", expected " +
+                std::to_string(gadget.spellId));
+        if (item->Spells[0].SpellTrigger != ITEM_SPELLTRIGGER_ON_USE)
+            problems.push_back("item spell is not triggered on use");
+    }
 
     SpellInfo const* spell = sSpellMgr->GetSpellInfo(gadget.spellId);
     if (!spell)
         problems.push_back("spell " + std::to_string(gadget.spellId) + " is not in the server's spell data");
-    else if (spell->GetDuration() != int32(gadget.objectLifetimeMs))
-        problems.push_back("spell lives " + Lifetime(spell->GetDuration()) + ", expected " + Lifetime(gadget.objectLifetimeMs));
+    else
+    {
+        if (spell->GetDuration() != int32(gadget.objectLifetimeMs))
+            problems.push_back("spell lives " + Lifetime(spell->GetDuration()) + ", expected " +
+                Lifetime(gadget.objectLifetimeMs));
+
+        // EffectTransmitted reads the object entry from this effect's MiscValue.
+        SpellEffectInfo const& effect = spell->Effects[EFFECT_0];
+        if (effect.Effect != SPELL_EFFECT_TRANS_DOOR)
+            problems.push_back("spell's first effect does not summon a world object");
+        else if (effect.MiscValue != int32(gadget.objectEntry))
+            problems.push_back("spell summons object " + std::to_string(effect.MiscValue) + ", expected " +
+                std::to_string(gadget.objectEntry));
+    }
 
     GameObjectTemplate const* info = sObjectMgr->GetGameObjectTemplate(gadget.objectEntry);
     if (!info)
         problems.push_back("no row in gameobject_template");
     else if (info->type != gadget.objectType)
-        problems.push_back("object type " + std::to_string(info->type) + ", expected " + std::to_string(gadget.objectType));
+        problems.push_back("object type " + std::to_string(info->type) + ", expected " +
+            std::to_string(gadget.objectType));
     else if (info->displayId != gadget.displayId)
-        problems.push_back("object displayId " + std::to_string(info->displayId) + ", expected " + std::to_string(gadget.displayId));
+        problems.push_back("object displayId " + std::to_string(info->displayId) + ", expected " +
+            std::to_string(gadget.displayId));
     else if (std::fabs(info->size - gadget.objectSize) > 0.001f)
-        problems.push_back("object size " + std::to_string(info->size) + ", expected " + std::to_string(gadget.objectSize));
+        problems.push_back("object size " + std::to_string(info->size) + ", expected " +
+            std::to_string(gadget.objectSize));
+
+    // The summon can succeed while the portal's click action is missing or points at another spell.
+    if (info && info->type == GAMEOBJECT_TYPE_SPELLCASTER && gadget.objectType == GAMEOBJECT_TYPE_SPELLCASTER)
+    {
+        if (info->spellcaster.spellId != SPELL_TRANSPOLYPORTER_TELEPORT)
+            problems.push_back("object casts spell " + std::to_string(info->spellcaster.spellId) + ", expected " +
+                std::to_string(SPELL_TRANSPOLYPORTER_TELEPORT));
+        if (!sSpellMgr->GetSpellInfo(info->spellcaster.spellId))
+            problems.push_back("object's click spell " + std::to_string(info->spellcaster.spellId) +
+                " is not in the server's spell data");
+    }
 
     return problems;
 }
@@ -161,14 +200,17 @@ public:
                 continue;
             }
 
-            LOG_ERROR("sql.sql", "mod-portablemail: '{}' is not usable - {}. Item {} / spell {} / object {}. See modules/mod-portablemail/data/sql/db-world/portablemail.sql.",
+            LOG_ERROR("sql.sql", "mod-portablemail: '{}' has invalid data - {}. Item {} / spell {} / object {}. "
+                      "See modules/mod-portablemail/data/sql/db-world/portablemail.sql.",
                       gadget.objectName, Join(problems), gadget.itemEntry, gadget.spellId, gadget.objectEntry);
         }
 
         if (ready == PortableGadgets.size())
-            LOG_INFO("server.loading", ">> mod-portablemail: all {} portable gadgets are complete (item, spell and world object).", ready);
+            LOG_INFO("server.loading", ">> mod-portablemail: all {} portable gadgets are complete "
+                     "(item, spell and world object).", ready);
         else
-            LOG_WARN("server.loading", ">> mod-portablemail: {}/{} portable gadgets are complete; the others cannot be used.",
+            LOG_WARN("server.loading", ">> mod-portablemail: {}/{} portable gadgets have the expected data; "
+                     "see the problems listed below.",
                      ready, PortableGadgets.size());
 
         for (PortableGadget const& gadget : PortableGadgets)
