@@ -13,6 +13,7 @@
 #include "AllCreatureScript.h"
 #include "AllSpellScript.h"
 #include "AscensionChangelogCompat.h"
+#include "AscensionCompatOpcodes.h"
 #include "AscensionCharacterSelection.h"
 #include "AscensionManastorm.h"
 #include "AscensionClassMechanics.h"
@@ -5240,6 +5241,11 @@ public:
       return false;
     }
 
+    // An opcode another module claimed is that module's to handle. This consumer is
+    // registered first, so absorbing it here would mean the owner never sees it.
+    if (AscensionCompatOpcodes::Dispatch(session, packet))
+      return false;
+
     if (ascensionCompatConfig.GetConfigValue<bool>(
             AscensionCompatConfig::LOG_CONSUMED_PACKETS)) {
       char const *name = ExtensionOpcodeName(uint16(opcode));
@@ -6286,6 +6292,13 @@ std::unordered_map<uint64, uint8> g_levelScalingPendingEngager;
 
 bool CanScaleCreature(Creature const* creature)
 {
+  // A module that scales per character (each viewer's own level, sent only to that viewer) owns the
+  // answer while it is on: this path lifts the creature object itself, which every client is told
+  // about, so the two would disagree and a character who never asked for scaling would see a raised
+  // world anyway. Read live, so either model can take over on a config reload.
+  if (LocalLevelScaling::CreatureScalingOwnedPerViewer.load(std::memory_order_relaxed))
+    return false;
+
   return LocalLevelScaling::CreatureEnabled.load(std::memory_order_relaxed) && creature &&
       !creature->GetMap()->IsScriptedPrivateInstance() &&
       !creature->IsPet() && !creature->IsTotem() && !creature->IsTrigger() && !creature->IsCritter() &&
