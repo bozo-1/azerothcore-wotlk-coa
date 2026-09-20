@@ -14,6 +14,8 @@
 #include "DBCStores.h"
 #include "DatabaseEnv.h"
 #include "DynamicObject.h"
+#include "GameObject.h"
+#include "GameTime.h"
 #include "GitRevision.h"
 #include "GossipDef.h"
 #include "Item.h"
@@ -62,6 +64,18 @@ void Require(bool condition, std::string const& message)
 {
     if (!condition)
         throw std::runtime_error(message);
+}
+
+std::list<GameObject*> OwnedGameObjects(Player* player, uint32 entry)
+{
+    Require(sObjectMgr->GetGameObjectTemplate(entry) != nullptr, "Unknown gameobject entry");
+    std::list<GameObject*> objects;
+    player->GetGameObjectListWithEntryInGrid(objects, entry, 100.0f);
+    objects.remove_if([player](GameObject* object)
+    {
+        return !object->IsInWorld() || object->GetOwnerGUID() != player->GetGUID() || !player->InSamePhase(object);
+    });
+    return objects;
 }
 
 void WriteResult(std::string const& path, Tree const& result)
@@ -736,6 +750,20 @@ private:
             return player->GetMap()->IsScriptedPrivateInstance();
         if (metric == "controls_self")
             return player->m_mover == player;
+        if (metric == "at_homebind")
+            return player->GetMapId() == player->m_homebindMapId &&
+                player->GetExactDist(player->m_homebindX, player->m_homebindY, player->m_homebindZ) <= 5.0f;
+        if (metric == "owned_gameobject_count" || metric == "gameobject_remaining_ms")
+        {
+            std::list<GameObject*> objects = OwnedGameObjects(player, step.get<uint32>("entry"));
+            if (metric == "owned_gameobject_count")
+                return objects.size();
+            if (objects.empty())
+                return 0;
+            Require(objects.size() == 1, "Gameobject lifetime needs exactly one owned object");
+            time_t expiry = objects.front()->GetRespawnTime();
+            return expiry ? std::max<time_t>(0, expiry - GameTime::GetGameTime().count()) * IN_MILLISECONDS : -1;
+        }
         if (metric == "dynamic_object" || metric == "dynamic_object_duration_ms")
         {
             Require(sSpellMgr->GetSpellInfo(spell) != nullptr, "Unknown ground-effect spell");
@@ -1153,6 +1181,15 @@ private:
                 player->GetSession()->HandlePetCastSpellOpcode(packet);
             else
                 player->GetSession()->HandleUseItemOpcode(packet);
+            record.put("result", "submitted; verify effects with assertions");
+        }
+        else if (action == "use_gameobject")
+        {
+            std::list<GameObject*> objects = OwnedGameObjects(player, step.get<uint32>("entry"));
+            Require(objects.size() == 1, "Gameobject use needs exactly one owned object");
+            WorldPacket packet(CMSG_GAMEOBJ_USE, 8);
+            packet << objects.front()->GetGUID();
+            player->GetSession()->HandleGameObjectUseOpcode(packet);
             record.put("result", "submitted; verify effects with assertions");
         }
         else if (action == "add_item")
