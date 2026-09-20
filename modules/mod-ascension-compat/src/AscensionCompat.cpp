@@ -4953,6 +4953,10 @@ public:
     if (opcode == CMSG_ANTICHEAT_ALERT)
       return true;
 
+    // The portrait menu's "Reset all Dungeons"; handled by the core.
+    if (opcode == CMSG_RESET_DUNGEONS)
+      return true;
+
     if (opcode == CMSG_CREATURE_QUERY_BULK)
     {
         constexpr uint32 maxCreatureQueries = 256;
@@ -5622,6 +5626,26 @@ public:
       return false;
   }
 
+  // Quest templates are shared globally, so scaling is serialized per player. The client caches quest
+  // queries by quest ID across characters and sessions, so resend the accepted quests' data whenever
+  // the effective quest level can differ from what it cached; this keeps the quest log colours right
+  // without mutating the canonical template for anyone else.
+  static void RefreshScaledQuestQueries(Player *player) {
+    if (!LocalLevelScaling::QuestEnabled.load(std::memory_order_relaxed))
+      return;
+
+    for (auto const& [questId, status] : player->getQuestStatusMap())
+    {
+      if (status.Status != QUEST_STATUS_INCOMPLETE &&
+          status.Status != QUEST_STATUS_COMPLETE &&
+          status.Status != QUEST_STATUS_FAILED)
+        continue;
+
+      if (Quest const* quest = sObjectMgr->GetQuestTemplate(questId))
+        player->PlayerTalkClass->SendQuestQueryResponse(quest);
+    }
+  }
+
   void OnPlayerLogin(Player *player) override {
     if (ascensionCompatConfig.GetConfigValue<bool>(
             AscensionCompatConfig::ENABLED)) {
@@ -5630,6 +5654,7 @@ public:
       SynchronizeAscensionClassMechanics(player);
       AscensionResourceService::Instance().OnPlayerLogin(player);
       AscensionCollectionService::Instance().OnPlayerLogin(player);
+      RefreshScaledQuestQueries(player);
     }
   }
 
@@ -5641,24 +5666,7 @@ public:
       AscensionClassService::Instance().SynchronizeProficiencies(player);
       AscensionClassService::Instance().SendCharacterAdvancementKnownEntries(player);
 
-      // Quest templates are shared globally, so scaling is serialized per
-      // player. Refresh accepted quest query data when the player's effective
-      // quest level changes; this keeps the quest log in sync without mutating
-      // the canonical template for anyone else.
-      if (LocalLevelScaling::QuestEnabled.load(std::memory_order_relaxed))
-      {
-        for (auto const& [questId, status] : player->getQuestStatusMap())
-        {
-          if (status.Status != QUEST_STATUS_INCOMPLETE &&
-              status.Status != QUEST_STATUS_COMPLETE &&
-              status.Status != QUEST_STATUS_FAILED)
-            continue;
-
-          if (Quest const* quest = sObjectMgr->GetQuestTemplate(questId))
-            if (quest->GetQuestLevel() <= 0 || quest->GetQuestLevel() < player->GetLevel())
-              player->PlayerTalkClass->SendQuestQueryResponse(quest);
-        }
-      }
+      RefreshScaledQuestQueries(player);
     }
   }
 
@@ -6148,17 +6156,48 @@ private:
     if (!map)
       return original;
 
+    // On se regle sur le joueur le PLUS PROCHE, et non sur le plus haut niveau
+    // a la ronde.
+    //
+    // POURQUOI CE CHANGEMENT
+    // La boucle d'origine prenait le maximum sur tous les joueurs a portee de
+    // vue. Sur un serveur ou les joueurs presents ont des niveaux voisins,
+    // c'est le bon choix : le contenu reste pertinent pour le groupe. Avec une
+    // population de bots, l'hypothese tombe. Un joueur de niveau 30 traversant
+    // une zone de depart hissait toute creature a portee au niveau 27, y
+    // compris celles que des bots de niveau 1 etaient en train de combattre a
+    // quarante metres de la. Ils se faisaient tuer par des creatures qui
+    // n'etaient pas les leurs.
+    //
+    // POURQUOI PAS « CELUI QUI ATTAQUE »
+    // Ce serait la regle juste, mais elle est irrealisable : une creature n'a
+    // qu'un seul niveau, diffuse a tous les clients. Le meme loup ne peut pas
+    // etre de niveau 1 pour un bot et de niveau 27 pour un joueur. Le plus
+    // proche en est l'approximation fidele : c'est lui qui va l'engager.
+    //
+    // Le reglage ne s'applique de toute facon qu'a une creature hors combat,
+    // vivante et au maximum de ses points de vie (voir OnAllCreatureUpdate) :
+    // un combat en cours ne change jamais de niveau sous les pieds de
+    // personne.
+    // A zero cap restores the original maximum across all eligible players.
+    bool const useNearestPlayer = LocalLevelScaling::CreatureMaxLift.load(std::memory_order_relaxed) != 0;
     uint8 desired = original;
     float range = creature->GetSightRange();
+    float meilleure = -1.0f;
     for (auto const& reference : map->GetPlayers())
     {
-      Player* player = reference.GetSource();
-      if (!player || !player->IsAlive() || player->IsGameMaster() ||
-          !creature->InSamePhase(player) || !creature->IsWithinDistInMap(player, range) ||
-          !player->IsValidAttackTarget(creature))
-        continue;
-      desired = std::max(desired, LocalLevelScaling::ScaleCreatureLevel(original, player->GetLevel(),
-          LocalLevelScaling::CreatureOffset.load(std::memory_order_relaxed)));
+        Player* player = reference.GetSource();
+        if (!player || !player->IsAlive() || player->IsGameMaster() ||
+            !creature->InSamePhase(player) || !creature->IsWithinDistInMap(player, range) ||
+            !player->IsValidAttackTarget(creature))
+            continue;
+        float distance = creature->GetExactDist(player);
+        if (useNearestPlayer && meilleure >= 0.0f && distance >= meilleure)
+            continue;
+        meilleure = distance;
+        uint8 const scaledLevel = LocalLevelScaling::ScaleCreatureLevel(original, player->GetLevel(),
+            LocalLevelScaling::CreatureOffset.load(std::memory_order_relaxed));
+        desired = useNearestPlayer ? scaledLevel : std::max(desired, scaledLevel);
     }
     return desired;
   }
@@ -6181,6 +6220,12 @@ public:
         AscensionCompatConfig::LEVEL_SCALING), std::memory_order_relaxed);
     LocalLevelScaling::QuestEnabled.store(enabled && ascensionCompatConfig.GetConfigValue<bool>(
         AscensionCompatConfig::QUEST_LEVEL_SCALING), std::memory_order_relaxed);
+
+    // Lu directement plutot que via l'enumeration du module : cela evite de
+    // toucher a sa table de reglages, et la valeur est rechargeable a chaud.
+    uint32 lift = sConfigMgr->GetOption<uint32>("AscensionCompat.LevelScalingMaxLift", 5);
+    LocalLevelScaling::CreatureMaxLift.store(
+        static_cast<std::uint8_t>(std::min<uint32>(lift, 255)), std::memory_order_relaxed);
   }
 
   void OnLoadCustomDatabaseTable() override {
