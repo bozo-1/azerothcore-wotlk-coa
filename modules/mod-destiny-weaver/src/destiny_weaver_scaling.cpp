@@ -236,12 +236,23 @@ namespace
     /// The armor the viewer's version of the creature wears. Installed as the core's resolver: this
     /// is the one fight input that cannot be reached from the viewer's own fields, because the blow
     /// is mitigated against the creature's armor inside Unit::CalcArmorReducedDamage.
-    uint32 ViewArmorFor(Player const* viewer, Creature const* creature)
+    std::optional<uint32> ViewArmorFor(Player const* viewer, Creature const* creature)
     {
         CreatureView view;
         if (!ViewFor(creature, const_cast<Player*>(viewer), view))
+            return std::nullopt;
+
+        if (creature->GetPctModifierValue(UNIT_MOD_ARMOR, TOTAL_PCT) <= 0.0f)
             return 0;
-        return view.Stats.Armor;
+
+        // Replace only the level-derived base; keep the same modifier order as
+        // Unit::GetTotalAuraModValue, including armor-reducing effects that reach zero.
+        float armor = creature->GetFlatModifierValue(UNIT_MOD_ARMOR, BASE_VALUE) + float(view.Stats.Armor) -
+            float(StatsAt(creature->GetLevel(), creature->GetCreatureTemplate()).Armor);
+        armor *= creature->GetPctModifierValue(UNIT_MOD_ARMOR, BASE_PCT);
+        armor += creature->GetFlatModifierValue(UNIT_MOD_ARMOR, TOTAL_VALUE);
+        armor *= creature->GetPctModifierValue(UNIT_MOD_ARMOR, TOTAL_PCT);
+        return uint32(std::max(0.0f, armor));
     }
 
     /// The level the viewer's version of the creature stands at, for the core's own per-target level
@@ -282,6 +293,14 @@ namespace
         for (uint16 index : VIEW_FIELDS)
             creature->ForceValuesUpdateAtIndex(index);
     }
+
+    constexpr char DAMAGE_REMAINDER_KEY[] = "DestinyWeaver.DamageRemainder";
+
+    // The remainder belongs to the shared health pool, not to a particular attacker.
+    struct DamageRemainder : DataMap::Base
+    {
+        double Value = 0.0;
+    };
 
     /// A client whose view stopped being true, until it has been re-sent.
     ///
@@ -487,7 +506,6 @@ namespace
         return g_leadersSeen.insert(guid.GetRawValue()).second;
     }
 
-
     void PatchField(ByteBuffer& data, BuildValuesCachePosPointers& pos, uint16 index, uint32 value)
     {
         auto it = pos.other.find(index);
@@ -633,7 +651,14 @@ public:
         if (!ViewFor(creature, player, view))
             return damage;
 
-        return std::max<uint32>(1, uint32(double(damage) * view.DamageDealtToPool));
+        if (!creature->IsAlive() || creature->IsEvadingAttacks())
+            return damage;
+
+        auto* remainder = creature->CustomData.GetDefault<DamageRemainder>(DAMAGE_REMAINDER_KEY);
+        double const total = double(damage) * view.DamageDealtToPool + remainder->Value;
+        uint32 const whole = uint32(total);
+        remainder->Value = total - whole;
+        return whole;
     }
 
     /// Damage from a creature to a character, melee. Runs while the hit is still being calculated, so
@@ -685,7 +710,6 @@ public:
     // numbers from a second definition, which is exactly how the two drift apart later.
 };
 
-
 /// Serves the refresh requests, on the thread that owns the object being refreshed.
 ///
 /// Creatures: one pass per creature update, which is the cheapest possible place to look - a single
@@ -698,10 +722,23 @@ public:
     destiny_weaver_view_refresh_script()
         : AllCreatureScript("destiny_weaver_view_refresh_script") { }
 
+    void OnCreatureSelectLevel(CreatureTemplate const* /*info*/, Creature* creature) override
+    {
+        creature->CustomData.Erase(DAMAGE_REMAINDER_KEY);
+    }
+
+    void OnCreatureRemoveWorld(Creature* creature) override
+    {
+        creature->CustomData.Erase(DAMAGE_REMAINDER_KEY);
+    }
+
     void OnAllCreatureUpdate(Creature* creature, uint32 /*diff*/) override
     {
         if (!creature || !creature->IsInWorld())
             return;
+
+        if (!creature->IsAlive() || creature->IsEvadingAttacks())
+            creature->CustomData.Erase(DAMAGE_REMAINDER_KEY);
 
         // Nothing pending: the whole world pays one relaxed atomic read per creature update.
         if (!g_viewRefreshCount.load(std::memory_order_relaxed))
@@ -732,7 +769,13 @@ class destiny_weaver_view_client_script : public PlayerScript
 public:
     destiny_weaver_view_client_script()
         : PlayerScript("destiny_weaver_view_client_script",
-                       { PLAYERHOOK_ON_LOGIN, PLAYERHOOK_ON_UPDATE, PLAYERHOOK_ON_LOGOUT }) { }
+                       { PLAYERHOOK_ON_LOGIN, PLAYERHOOK_ON_UPDATE, PLAYERHOOK_ON_LOGOUT,
+                         PLAYERHOOK_ON_LEVEL_CHANGED }) { }
+
+    void OnPlayerLevelChanged(Player* player, uint8 /*oldLevel*/) override
+    {
+        DestinyWeaver::RefreshClient(player);
+    }
 
     /// The baseline the group notifications are measured against: whatever is true of this character
     /// the moment they enter the world. Nothing is sent here - a character is never told about a

@@ -2240,8 +2240,8 @@ uint32 Unit::CalcArmorReducedDamage(Unit const* attacker, Unit const* victim, co
     // defended like the level 2 creature it actually is, and the blow lands as if it were undefended.
     if (Creature const* creature = victim->ToCreature())
         if (Player* viewer = attacker ? attacker->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr)
-            if (uint32 const viewArmor = LocalLevelScaling::ViewArmorFor(viewer, creature))
-                armor = float(viewArmor);
+            if (auto const viewArmor = LocalLevelScaling::ViewArmorFor(viewer, creature))
+                armor = float(*viewArmor);
 
     // Ignore enemy armor by SPELL_AURA_MOD_TARGET_RESISTANCE aura
     if (attacker)

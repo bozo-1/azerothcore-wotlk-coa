@@ -63,7 +63,8 @@ namespace DestinyWeaver
     /// own switches are checked by the core before this is asked.
     bool ResolveQuestScaling(Player const* player);
 
-    /// Handles the client's level-scaling opcode. Returns true when the packet was fully handled,
+    /// Queues the client's level-scaling choice without accessing a Player on the network thread.
+    /// Returns true when the packet was consumed,
     /// which is what both callers - the compat module's opcode dispatch and this module's own
     /// ServerScript, used when compat is switched off - do with the result.
     bool HandleClientLevelScalingPacket(WorldSession* session, WorldPacket const& packet);

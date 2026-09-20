@@ -60,8 +60,23 @@
 
 #include "../../mod-ascension-compat/src/AscensionCompatOpcodes.h"
 
+#include <mutex>
+#include <optional>
+#include <unordered_map>
+
 namespace
 {
+    struct PendingScalingChoice
+    {
+        ObjectGuid PlayerGuid;
+        std::optional<bool> Enabled;
+    };
+
+    // Only logged-in characters can receive a choice. Session pointers are identity keys only,
+    // removed on logout; player state is accessed exclusively by the player hooks below.
+    std::mutex g_scalingChoiceLock;
+    std::unordered_map<WorldSession const*, PendingScalingChoice> g_scalingChoices;
+
     /// Stored value of a choice: 0 = the character never made one, 1 = on, 2 = off. Keeping "never
     /// chose" distinct from "chose off" is what lets a realm default exist without rewriting every
     /// character's row the first time the default changes.
@@ -346,26 +361,65 @@ void SetExperienceBonusControl(Player* player, bool enabled)
 
 bool HandleClientLevelScalingPacket(WorldSession* session, WorldPacket const& packet)
 {
-    Player* player = session ? session->GetPlayer() : nullptr;
-    if (!player)
+    if (!session)
         return false;
 
     if (packet.size() < sizeof(uint32))
     {
         LOG_WARN("module.destiny_weaver",
-                 "Short level-scaling packet from {}: {} bytes - ignored",
-                 player->GetName(), packet.size());
+                 "Short level-scaling packet from account {}: {} bytes - ignored",
+                 session->GetAccountId(), packet.size());
         return true;
     }
 
-    uint32 const enabled = packet.read<uint32>(0);
-    SetLevelScaling(player, enabled != 0);
-
-    LOG_INFO("module.destiny_weaver", "{} chose open-world scaling {} from the client",
-             player->GetName(), enabled ? "on" : "off");
+    std::lock_guard<std::mutex> guard(g_scalingChoiceLock);
+    auto itr = g_scalingChoices.find(session);
+    if (itr != g_scalingChoices.end())
+        itr->second.Enabled = packet.read<uint32>(0) != 0;
     return true;
 }
 }
+
+class destiny_weaver_choice_script : public PlayerScript
+{
+public:
+    destiny_weaver_choice_script()
+        : PlayerScript("destiny_weaver_choice_script",
+                       { PLAYERHOOK_ON_LOGIN, PLAYERHOOK_ON_UPDATE, PLAYERHOOK_ON_LOGOUT }) { }
+
+    void OnPlayerLogin(Player* player) override
+    {
+        std::lock_guard<std::mutex> guard(g_scalingChoiceLock);
+        g_scalingChoices[player->GetSession()] = {player->GetGUID(), std::nullopt};
+    }
+
+    void OnPlayerUpdate(Player* player, uint32 /*diff*/) override
+    {
+        if (!player->IsInWorld())
+            return;
+
+        std::optional<bool> enabled;
+        {
+            std::lock_guard<std::mutex> guard(g_scalingChoiceLock);
+            auto itr = g_scalingChoices.find(player->GetSession());
+            if (itr == g_scalingChoices.end() || itr->second.PlayerGuid != player->GetGUID())
+                return;
+            enabled = itr->second.Enabled;
+            itr->second.Enabled.reset();
+        }
+
+        if (enabled)
+            DestinyWeaver::SetLevelScaling(player, *enabled);
+    }
+
+    void OnPlayerLogout(Player* player) override
+    {
+        std::lock_guard<std::mutex> guard(g_scalingChoiceLock);
+        auto itr = g_scalingChoices.find(player->GetSession());
+        if (itr != g_scalingChoices.end() && itr->second.PlayerGuid == player->GetGUID())
+            g_scalingChoices.erase(itr);
+    }
+};
 
 /// Keeps the group's view of the world honest.
 ///
@@ -482,6 +536,7 @@ void AddSC_destiny_weaver()
                                   &DestinyWeaver::HandleClientLevelScalingPacket);
 
     new npc_destiny_weaver();
+    new destiny_weaver_choice_script();
     new destiny_weaver_group_script();
     new destiny_weaver_server_script();
 }

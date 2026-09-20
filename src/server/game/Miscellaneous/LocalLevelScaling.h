@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <optional>
 
 class Creature;
 class Player;
@@ -90,23 +91,24 @@ inline bool QuestScalingEnabled(Player const* player)
     if (!QuestEnabled.load(std::memory_order_relaxed))
         return false;
 
-    return ScalingChoiceEnabled(player);
+    QuestScalingResolver const owner = QuestScalingOwner.load(std::memory_order_relaxed);
+    return !owner || owner(player);
 }
 
 /// One character's version of one creature, asked for by the few places in the core that compute a
 /// fight and cannot see the viewer's object fields: the armor a blow lands against, today. Returns
-/// the armor the viewer's version of the creature wears, or 0 when the creature is already their
+/// the armor the viewer's version of the creature wears, or nullopt when the creature is already their
 /// version of it.
 ///
 /// The implementation stays with whichever module owns the character's choice, so the level, the
 /// pool, the armor and the damage all come out of one place and cannot disagree.
-using CreatureViewArmorResolver = std::uint32_t (*)(Player const*, Creature const*);
+using CreatureViewArmorResolver = std::optional<std::uint32_t> (*)(Player const*, Creature const*);
 inline std::atomic<CreatureViewArmorResolver> CreatureViewArmorOwner{nullptr};
 
-inline std::uint32_t ViewArmorFor(Player const* viewer, Creature const* creature)
+inline std::optional<std::uint32_t> ViewArmorFor(Player const* viewer, Creature const* creature)
 {
     CreatureViewArmorResolver const owner = CreatureViewArmorOwner.load(std::memory_order_relaxed);
-    return owner ? owner(viewer, creature) : 0;
+    return owner ? owner(viewer, creature) : std::nullopt;
 }
 
 /// The level one character's version of one creature stands at, or zero when that character sees
