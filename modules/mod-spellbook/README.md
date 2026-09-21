@@ -19,6 +19,11 @@ restored to this realm's trainer data at all.
   class - the realm's class spell data, the client's rank ladders and the recovered tables below.
   The list is the server's own trainer list, so a book opened by another player still shows the
   viewer's class, and `Train` (`CMSG_TRAINER_BUY_SPELL`) learns the rank and charges its price.
+- **The refresh.** Because the row set is the server's, a purchase republishes the window: the rank just
+  bought leaves it and the rank above it becomes trainable in the same window, so a rank ladder is bought in
+  a row instead of one rank per reopen. A client redraws a trainer window only when a new one arrives, which
+  is why reopening the book showed the next rank — the refresh sends the same state the player used to get
+  by closing and reopening.
 - **The alert.** Before a spell is learned, the module sends the client the row of its own
   `SpellCustomAttr` table for that spell with the notable bit set (`SMSG_PATCH_SPELL_CUSTOM_ATTR`).
   That bit is what makes the client show *New Spell Learned* and play its sound: a rank up of an
@@ -81,9 +86,11 @@ window with your own class, and Train learns the rank and pays for it.
 The gameplay test driver in `mod-ascension-compat` exposes the whole path as metrics
 (`spellbook_rows`, `spellbook_offers_spell`, `spellbook_buy_succeeded`, `spellbook_learned_alerts`,
 `spellbook_unannounced_buys`, ...) through its `trainer_buy` action, and one scenario replays the
-live report of three purchases that were granted without announcing themselves:
+live report of three purchases that were granted without announcing themselves, and a second one buys a
+whole rank ladder in one open window (`books-rank-refresh.json`):
 
 ```
 python apps/coa-gameplay-test/run.py validate apps/coa-gameplay-test/scenarios/books-live-repro.json
 python apps/coa-gameplay-test/run.py run apps/coa-gameplay-test/scenarios/books-live-repro.json
+python apps/coa-gameplay-test/run.py run apps/coa-gameplay-test/scenarios/books-rank-refresh.json
 ```

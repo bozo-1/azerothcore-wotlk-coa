@@ -238,6 +238,9 @@ struct Actor
     uint32 buysGranted = 0;
     uint32 buysUnannounced = 0;
     uint32 buysMisannounced = 0;
+    uint32 trainerWindows = 0;                    // trainer windows this session has been sent
+    uint32 trainerWindowRows = 0;                 // rows in the last of them
+    std::map<uint32, uint8> trainerWindowState;   // spell -> the state byte that window gave the row
     uint32 whoResponses = 0;
     uint32 lootReceived = 0;
     std::array<uint32, 2> meleeAttacksByHand{};
@@ -695,6 +698,40 @@ private:
                         ++actor.buyFailed[bought];
                 }
 
+                // A trainer window is the whole of what the client draws and gates Train on, so the
+                // last one this session was sent is recorded: how many rows it carried and the state
+                // byte each spell's row got. A row a later window no longer holds is therefore absent,
+                // which is how a test tells "the book stopped selling this" from "still on screen".
+                if (packet.GetOpcode() == SMSG_TRAINER_LIST)
+                {
+                    WorldPacket window(packet);
+                    ObjectGuid trainer;
+                    int32 type = 0;
+                    int32 rows = 0;
+                    window >> trainer >> type >> rows;
+                    ++actor.trainerWindows;
+                    actor.trainerWindowRows = rows > 0 ? uint32(rows) : 0;
+                    actor.trainerWindowState.clear();
+                    for (int32 i = 0; i < rows; ++i)
+                    {
+                        int32 rowSpell = 0;
+                        uint8 state = 0;
+                        int32 price = 0;
+                        uint32 pointCost0 = 0;
+                        uint32 pointCost1 = 0;
+                        uint8 requiredLevel = 0;
+                        uint32 skillLine = 0;
+                        uint32 skillRank = 0;
+                        uint32 ability1 = 0;
+                        uint32 ability2 = 0;
+                        uint32 ability3 = 0;
+                        window >> rowSpell >> state >> price >> pointCost0 >> pointCost1 >> requiredLevel
+                               >> skillLine >> skillRank >> ability1 >> ability2 >> ability3;
+                        if (rowSpell > 0)
+                            actor.trainerWindowState[uint32(rowSpell)] = state;
+                    }
+                }
+
                 if (packet.GetOpcode() != SMSG_WHO)
                     return;
                 WorldPacket response(packet);
@@ -1105,7 +1142,7 @@ private:
         if (metric == "knows_spell" || metric == "cooldown_ms" || metric == "spell_charges" ||
             metric == "global_cooldown_ms" || metric == "has_talent" ||
             metric == "spellbook_offers_spell" || metric == "spellbook_covers_spell" ||
-            metric == "temporary_spell_replacement")
+            metric == "trainer_window_state" || metric == "temporary_spell_replacement")
             Require(sSpellMgr->GetSpellInfo(spell) != nullptr, "Unknown spell in metric");
         if (metric == "knows_spell")
             return player->HasSpell(spell);
@@ -1146,6 +1183,17 @@ private:
             auto const& alerts = _actors.at(step.get<std::string>("actor")).learnedAlerts;
             auto const found = alerts.find(spell);
             return found == alerts.end() ? 0.0 : double(found->second);
+        }
+        if (metric == "trainer_list_packets")
+            return double(_actors.at(step.get<std::string>("actor")).trainerWindows);
+        if (metric == "trainer_window_rows")
+            return double(_actors.at(step.get<std::string>("actor")).trainerWindowRows);
+        if (metric == "trainer_window_state")
+        {
+            auto const& window = _actors.at(step.get<std::string>("actor")).trainerWindowState;
+            auto const found = window.find(spell);
+            // Absent is its own answer: the row the book used to sell is gone rather than refused.
+            return found == window.end() ? -1.0 : double(found->second);
         }
         if (metric == "quest_rewarded")
         {
@@ -1986,6 +2034,14 @@ private:
                 Require(aura != nullptr, "Could not apply fixture aura");
                 aura->SetStackAmount(uint8(stacks));
             }
+        }
+        else if (action == "money")
+        {
+            // Fixture setup: a priced trainer row cannot be bought on the realm's starting purse.
+            int32 const copper = step.get<int32>("copper");
+            Require(copper > 0, "Money fixture needs a positive copper amount");
+            player->ModifyMoney(copper);
+            Require(player->GetMoney() >= uint32(copper), "Money fixture failed");
         }
         else if (action == "learn")
         {

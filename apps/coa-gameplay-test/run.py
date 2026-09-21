@@ -42,6 +42,7 @@ METRICS = {
     'spellbook_buy_succeeded', 'spellbook_buy_failed',
     'spellbook_buys_granted', 'spellbook_unannounced_buys', 'spellbook_misannounced_buys',
     'spellbook_notify_rows', 'spellbook_notified_spells', 'spellbook_unnotified_buys',
+    'trainer_list_packets', 'trainer_window_rows', 'trainer_window_state',
     'cast_speed_multiplier', 'spell_crit_chance', 'spell_power_cost', 'spell_damage_done', 'melee_damage_done',
     'who_count', 'who_class', 'loot_count', 'loot_entry', 'loot_received',
     'quest_rewarded', 'spell_damage_taken', 'melee_damage_taken', 'spell_healing_taken',
@@ -95,6 +96,7 @@ ACTIONS = {
     'assert': ({'actor', 'metric'}, METRIC_FIELDS | {'equals', 'min', 'max', 'within_ms'}),
     'learn': ({'actor', 'spell'}, {'actor', 'spell'}),
     'unlearn': ({'actor', 'spell'}, {'actor', 'spell', 'all_specs'}),
+    'money': ({'actor', 'copper'}, {'actor', 'copper'}),
     'set_aura': ({'actor', 'spell', 'stacks'}, {'actor', 'spell', 'stacks', 'pet'}),
     'cast': ({'actor', 'spell'}, {'actor', 'spell', 'target', 'destination'}),
     'attack': ({'actor', 'target'}, {'actor', 'target', 'pet'}),
@@ -279,6 +281,8 @@ def validate(scenario):
         for key in ('ms', 'within_ms'):
             if key in step:
                 number(step[key], f'{where}.{key}', 0, scenario.get('timeout_ms', 90000), True)
+        if action == 'money':
+            number(step['copper'], f'{where}.copper', 1, 2**31 - 1, True)
         if action == 'set_level':
             number(step['value'], f'{where}.value', 1, 80, True)
         if action == 'level_scaling_packet':
@@ -314,7 +318,8 @@ def validate(scenario):
                     'spell_immune', 'spell_effect_immune', 'spell_damage_count', 'spell_damage_total',
                     'spell_uses_armor', 'pet_aura_amount', 'pet_aura_amplitude_ms', 'spell_heal_count', 'spell_heal_total',
                     'spell_effective_heal_total', 'spell_energize_count', 'spell_energize_total',
-                    'spell_proc_count', 'temporary_spell_replacement', 'cast_failure'}:
+                    'spell_proc_count', 'temporary_spell_replacement', 'cast_failure',
+                    'trainer_window_state'}:
                 require('spell' in step, f'{where}: metric needs spell')
             for key in ('pet', 'critical'):
                 if key in step:
@@ -399,6 +404,7 @@ def validate(scenario):
                           'spellbook_misannounced_buys',
                           'spellbook_notify_rows', 'spellbook_notified_spells',
                           'spellbook_unnotified_buys',
+                          'trainer_list_packets', 'trainer_window_rows', 'trainer_window_state',
                           'cast_speed_multiplier', 'spell_crit_chance', 'spell_power_cost',
                           'spell_damage_done', 'melee_damage_done',
                           'who_count', 'who_class',

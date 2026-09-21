@@ -17,7 +17,9 @@
  *  * Purchases are answered here too. The core resolves trainers per creature entry
  *    (sObjectMgr->GetTrainer(npc->GetEntry())), which cannot serve a list that depends on who
  *    is looking, and Trainer::TeachSpell runs the same class/race filter that would refuse
- *    every one of these spells.
+ *    every one of these spells. Because the row set is the server's, a purchase also re-publishes
+ *    it: the rank just bought leaves the window and the rank above it becomes trainable in the
+ *    same window, so a rank ladder can be bought in a row instead of one rank per reopen.
  *
  * The list itself is what automatic progression would have granted: class progression spells,
  * rank upgrades gated on their first rank, and the automatic talent entries. No ability is
@@ -537,6 +539,14 @@ namespace
         WorldPacket succeeded(SMSG_TRAINER_BUY_SUCCEEDED);
         succeeded << book->GetGUID() << uint32(wanted);
         player->SendDirectMessage(&succeeded);
+
+        // The row set belongs to the server, and a purchase invalidates the window that is still
+        // on screen: the rank just bought has to leave it and the rank above it has to become
+        // trainable without closing and reopening the book. A client only redraws a trainer window
+        // when a new one arrives - reopening the book is exactly that - so the refreshed rows are
+        // published here. Sent even when they come out empty, because an empty window is the truth
+        // about what is left to train.
+        SendTrainerWindow(player, book, BuildRows(player));
 
         // The one line that says whether the client was told: the core announces an ability it
         // added, the book announces a rank the core answered with SMSG_SUPERCEDED_SPELL, and a

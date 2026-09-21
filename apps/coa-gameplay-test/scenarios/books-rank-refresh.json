@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "name": "Book of Ascension: ranks are bought in a row, without reopening the book",
+  "contract": "A purchase re-publishes the book's window: the rank just bought leaves it and the rank above it becomes trainable in the same window, so a ladder is bought in a row. Availability is unchanged - a rank above the character's level stays unavailable.",
+  "timeout_ms": 180000,
+  "players": [
+    { "id": "wh", "race": 1, "class": 15, "level": 60 }
+  ],
+  "steps": [
+    { "action": "money", "actor": "wh", "copper": 200000, "label": "fixture: a purse deep enough for the ladder" },
+    { "action": "learn", "actor": "wh", "spell": 680494, "label": "fixture: the tree granted Witchblight's first rank" },
+    { "action": "learn", "actor": "wh", "spell": 97930, "label": "learn the book companion spell" },
+    { "action": "cast", "actor": "wh", "spell": 97930, "label": "summon the Book of Ascension" },
+    { "action": "assert", "actor": "wh", "metric": "owned_creature_count", "entry": 75115, "equals": 1, "within_ms": 5000, "label": "the book is out" },
+
+    { "action": "gossip_hello", "actor": "wh", "label": "open the book" },
+    { "action": "assert", "actor": "wh", "metric": "gossip_options", "equals": 0, "label": "the book answered with a trainer window" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_list_packets", "equals": 1, "label": "one window was sent" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_window_rows", "min": 1, "label": "the window carries rows" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_window_state", "spell": 681540, "equals": 0, "label": "rank 2 is trainable" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_window_state", "spell": 681218, "equals": 0, "label": "rank 3 is trainable at level 60" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_window_state", "spell": 681219, "equals": 0, "label": "rank 4 is trainable at level 60" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_window_state", "spell": 681220, "equals": 0, "label": "rank 5 is trainable at level 60" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_window_state", "spell": 681221, "equals": 1, "label": "rank 6 needs level 68 and stays unavailable" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_window_state", "spell": 680494, "equals": -1, "label": "the tree's own rank is never sold" },
+
+    { "action": "trainer_buy", "actor": "wh", "spell": 681540, "label": "buy rank 2" },
+    { "action": "assert", "actor": "wh", "metric": "spellbook_buy_succeeded", "spell": 681540, "equals": 1, "label": "rank 2 was granted" },
+    { "action": "assert", "actor": "wh", "metric": "knows_spell", "spell": 681540, "equals": 1, "label": "rank 2 was learned" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_list_packets", "equals": 2, "label": "the purchase re-published the window" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_window_state", "spell": 681540, "equals": -1, "label": "the rank just bought left the window" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_window_state", "spell": 681218, "equals": 0, "label": "rank 3 is trainable in the same window" },
+
+    { "action": "trainer_buy", "actor": "wh", "spell": 681218, "label": "buy rank 3 without reopening" },
+    { "action": "assert", "actor": "wh", "metric": "spellbook_buy_succeeded", "spell": 681218, "equals": 1, "label": "rank 3 was granted" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_list_packets", "equals": 3, "label": "the window was published again" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_window_state", "spell": 681219, "equals": 0, "label": "rank 4 is trainable in the same window" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_window_state", "spell": 681221, "equals": 1, "label": "rank 6 is still unavailable" },
+
+    { "action": "trainer_buy", "actor": "wh", "spell": 681219, "label": "buy rank 4 without reopening" },
+    { "action": "assert", "actor": "wh", "metric": "spellbook_buy_succeeded", "spell": 681219, "equals": 1, "label": "rank 4 was granted" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_window_state", "spell": 681220, "equals": 0, "label": "rank 5 is trainable in the same window" },
+
+    { "action": "trainer_buy", "actor": "wh", "spell": 681220, "label": "buy rank 5 without reopening" },
+    { "action": "assert", "actor": "wh", "metric": "spellbook_buy_succeeded", "spell": 681220, "equals": 1, "label": "rank 5 was granted" },
+    { "action": "assert", "actor": "wh", "metric": "knows_spell", "spell": 681220, "equals": 1, "label": "the ladder was bought to its top" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_list_packets", "equals": 5, "label": "every purchase published a window" },
+    { "action": "assert", "actor": "wh", "metric": "trainer_window_state", "spell": 681220, "equals": -1, "label": "the top rank left the window too" },
+
+    { "action": "assert", "actor": "wh", "metric": "spellbook_misannounced_buys", "equals": 0, "label": "every purchase still announced itself exactly once" }
+  ]
+}
