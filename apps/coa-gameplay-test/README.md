@@ -232,6 +232,8 @@ damage coefficients.
 | `group` | `actor`, `target`: fixture party; creates the actor's group if needed and adds an ungrouped player. |
 | `cast_charm` | Same fields: native pet-cast handler, with the charmed unit as the default target. |
 | `gossip_hello` | `actor`, optional `target`: native gossip handler; defaults to the actor's summoned companion. |
+| `banker_activate` | `actor`, optional `target`, or optional `owner` + `entry`: native banker click (`CMSG_BANKER_ACTIVATE`); defaults to the actor's summoned companion, and `owner` aims it at a companion another actor summoned, walking up to it first. |
+| `area_trigger` | `actor`, `id`: native area-trigger packet, as the client sends on walking into one; inn triggers are what set the rested flag. |
 | `gossip_select` | `actor`, zero-based `option`: select from the current menu through the session handler. |
 | `who` | `actor`, optional name-filter `target`, `class_mask`, `race_mask`: submit a native Who query. |
 | `add_item` | `actor`, `item`, optional `count` (default 1): grant fixture inventory. |
@@ -265,7 +267,8 @@ Metrics: `health`, `max_health`, `power`, `max_power`, `alive`, `combat`, `casti
 `has_talent`, `talent_points`, `cooldown_ms`, `item_count`, `carried_item_count`, `bank_bag_slots`, `aura`, `aura_stacks`, `aura_charges`,
 `aura_duration_ms`, `aura_amount`, `pet_entry`, `pet_aura_stacks`, `owned_creature_count`,
 `charm_entry`, `charm_aura_stacks`, `controls_self`, `private_instance`, `dynamic_object`,
-`dynamic_object_duration_ms`, `distance`, `spell_proc_count`, `spell_cast_count`, `temporary_spell_replacement`.
+`dynamic_object_duration_ms`, `distance`, `spell_proc_count`, `spell_cast_count`, `temporary_spell_replacement`,
+`bank_shows`, `system_messages`, `cast_failure`, `pet_is_banker`, `pet_display`, `pet_scale`.
 Boolean metrics use 0/1. Spell/aura metrics require `spell`; `item_count` requires `item`.
 `carried_item_count` sums the stack counts of equipped items (bags included), the backpack and the bags' contents.
 `aura_positive` reads the applied aura's beneficial flag; check `aura` separately to distinguish absence from a debuff.
@@ -369,7 +372,15 @@ client draws.
 `has_talent` requires the talent rank's spell ID; passive talents are separate from the learned spellbook.
 `talent_points` measures unspent points in the active specialization.
 `bank_bag_slots` measures the player's unlocked standard bank bag slots (0..7).
-`pet_entry` measures the player's current guardian pet entry, or zero if absent. `pet_aura_stacks`
+`pet_entry` measures the player's current guardian pet entry, or the entry of the companion it summoned
+(a minipet, which never occupies the guardian slot), or zero if absent; `pet_display`, `pet_scale`
+and `pet_is_banker` read the same unit.
+`bank_shows` counts the native bank windows the actor's session has been sent, which is what a
+banker click is answered with. `system_messages` counts the chat lines the session has been sent.
+`cast_failure` requires `spell` and reports the reason the client was told the last submitted cast of
+that spell was refused, or zero if it was not refused since (the record is cleared when the scenario
+submits that spell again).
+`pet_aura_stacks`
 requires `spell`, accepts `caster` for aura ownership, and returns zero if the pet or aura is absent.
 `pet_aura_amount` and `pet_aura_amplitude_ms` accept `effect` and read its amount or tick interval.
 `spell_energize_count` and `spell_energize_total` observe native instant and periodic energize logs, excluding

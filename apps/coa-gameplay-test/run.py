@@ -33,8 +33,8 @@ METRICS = {
     'health', 'health_pct', 'max_health', 'power', 'max_power', 'alive', 'combat', 'casting', 'level',
     'aura', 'aura_stacks', 'aura_charges', 'aura_duration_ms', 'aura_amount', 'aura_positive',
     'knows_spell', 'has_talent', 'talent_points', 'cooldown_ms', 'global_cooldown_ms', 'spell_charges',
-    'item_count', 'carried_item_count', 'bank_bag_slots',
-    'taxi_node', 'pet_entry', 'pet_aura_stacks', 'owned_creature_count',
+    'item_count', 'carried_item_count', 'bank_bag_slots', 'bank_shows', 'system_messages',
+    'taxi_node', 'pet_entry', 'pet_aura_stacks', 'pet_is_banker', 'pet_display', 'pet_scale', 'owned_creature_count',
     'charm_entry', 'charm_aura_stacks', 'controls_self', 'private_instance',
     'dynamic_object', 'dynamic_object_duration_ms', 'gossip_options',
     'owned_gameobject_count', 'gameobject_remaining_ms', 'at_homebind',
@@ -45,7 +45,7 @@ METRICS = {
     'cast_speed_multiplier', 'spell_crit_chance', 'spell_power_cost', 'spell_damage_done', 'melee_damage_done',
     'who_count', 'who_class', 'loot_count', 'loot_entry', 'loot_received',
     'quest_rewarded', 'spell_damage_taken', 'melee_damage_taken', 'spell_healing_taken',
-    'spell_hit_bonus_taken', 'rooted', 'spell_cast_count', 'spell_go_count',
+    'spell_hit_bonus_taken', 'rooted', 'spell_cast_count', 'spell_go_count', 'cast_failure',
     'stealth_detection', 'can_detect',
     'quest_status', 'quest_takeable', 'quest_objective_count', 'dialog_status',
     'ball_offer_count', 'ball_offers_quest',
@@ -102,6 +102,8 @@ ACTIONS = {
     'group': ({'actor', 'target'}, {'actor', 'target'}),
     'cast_charm': ({'actor', 'spell'}, {'actor', 'spell', 'target'}),
     'gossip_hello': ({'actor'}, {'actor', 'target'}),
+    'banker_activate': ({'actor'}, {'actor', 'target', 'owner', 'entry'}),
+    'area_trigger': ({'actor', 'id'}, {'actor', 'id'}),
     'trainer_buy': ({'actor', 'spell'}, {'actor', 'spell', 'target'}),
     'gossip_select': ({'actor', 'option'}, {'actor', 'option'}),
     'who': ({'actor'}, {'actor', 'target', 'race_mask', 'class_mask'}),
@@ -312,7 +314,7 @@ def validate(scenario):
                     'spell_immune', 'spell_effect_immune', 'spell_damage_count', 'spell_damage_total',
                     'spell_uses_armor', 'pet_aura_amount', 'pet_aura_amplitude_ms', 'spell_heal_count', 'spell_heal_total',
                     'spell_effective_heal_total', 'spell_energize_count', 'spell_energize_total',
-                    'spell_proc_count', 'temporary_spell_replacement'}:
+                    'spell_proc_count', 'temporary_spell_replacement', 'cast_failure'}:
                 require('spell' in step, f'{where}: metric needs spell')
             for key in ('pet', 'critical'):
                 if key in step:
@@ -367,7 +369,7 @@ def validate(scenario):
                 require('entry' in step, f'{where}: metric needs creature entry')
                 require('caster' not in step or 'spell' in step, f'{where}: aura caster filter needs spell')
             if metric in {'spellbook_offers_spell', 'spellbook_learned_alerts',
-                          'spellbook_buy_succeeded', 'spellbook_buy_failed'}:
+                          'spellbook_buy_succeeded', 'spellbook_buy_failed', 'cast_failure'}:
                 require('spell' in step, f'{where}: metric needs spell')
             if metric in {'owned_gameobject_count', 'gameobject_remaining_ms'}:
                 require('entry' in step, f'{where}: metric needs gameobject entry')
@@ -385,7 +387,9 @@ def validate(scenario):
                 require('id' in step, f'{where}: metric needs text id')
             if metric in {'knows_spell', 'has_talent', 'talent_points', 'cooldown_ms', 'spell_charges', 'item_count',
                           'carried_item_count', 'bank_bag_slots', 'taxi_node', 'cast_pushback_ms',
-                          'pet_entry', 'pet_aura_stacks', 'owned_creature_count', 'charm_entry',
+                          'bank_shows', 'system_messages', 'cast_failure',
+                          'pet_entry', 'pet_aura_stacks', 'pet_is_banker', 'pet_display', 'pet_scale',
+                          'owned_creature_count', 'charm_entry',
                           'charm_aura_stacks', 'controls_self', 'private_instance',
                           'dynamic_object', 'dynamic_object_duration_ms', 'gossip_options',
                           'owned_gameobject_count', 'gameobject_remaining_ms', 'at_homebind',

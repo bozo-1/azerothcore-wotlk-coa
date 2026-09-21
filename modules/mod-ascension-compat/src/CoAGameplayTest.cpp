@@ -248,6 +248,9 @@ struct Actor
     std::vector<SpellHealEvent> spellHeals;
     std::vector<SpellEnergizeEvent> spellEnergizes;
     Tree castFailures;
+    std::map<uint32, uint8> castFailureReason; // spell -> the reason its last attempt was refused
+    uint32 bankShows = 0;      // native bank windows this session has been sent
+    uint32 systemMessages = 0; // chat lines this session has been told
     std::map<uint64, std::map<uint16, uint32>> unitValues;
     uint32 lastQuestWindow = 0; // the last quest window this session sent, by opcode
     std::unique_ptr<WorldSession> session;
@@ -596,7 +599,16 @@ private:
                     failure.put("spell", spell);
                     failure.put("reason", uint32(reason));
                     actor.castFailures.push_back({"", failure});
+                    actor.castFailureReason[spell] = reason;
                 }
+
+                // The two halves of a refusal a module explains itself: the chat line it sends and
+                // the window it withholds. A click answered with neither is what a silent refusal
+                // looks like, so both are counted.
+                if (packet.GetOpcode() == SMSG_MESSAGECHAT)
+                    ++actor.systemMessages;
+                if (packet.GetOpcode() == SMSG_SHOW_BANK)
+                    ++actor.bankShows;
                 ObserveUnitValues(actor, packet);
                 if (packet.GetOpcode() == SMSG_ATTACKERSTATEUPDATE)
                 {
@@ -1476,12 +1488,38 @@ private:
                     && player->InSamePhase(creature) && (!spell || creature->GetAura(spell, caster));
             });
         }
-        if (metric == "pet_entry" || metric == "pet_aura_stacks" || metric == "pet_aura_amount" || metric == "pet_aura_amplitude_ms" ||
-            metric == "pet_max_health" || metric == "pet_attack_power" || metric == "pet_run_speed_rate")
+        if (metric == "bank_shows")
+            return double(_actors.at(step.get<std::string>("actor")).bankShows);
+        if (metric == "system_messages")
+            return double(_actors.at(step.get<std::string>("actor")).systemMessages);
+        if (metric == "cast_failure")
         {
-            Guardian* pet = player->GetGuardianPet();
+            auto const& reasons = _actors.at(step.get<std::string>("actor")).castFailureReason;
+            auto const found = reasons.find(spell);
+            return found == reasons.end() ? 0.0 : double(found->second);
+        }
+        if (metric == "pet_entry" || metric == "pet_aura_stacks" || metric == "pet_aura_amount" || metric == "pet_aura_amplitude_ms" ||
+            metric == "pet_max_health" || metric == "pet_attack_power" || metric == "pet_run_speed_rate" ||
+            metric == "pet_is_banker" || metric == "pet_display" || metric == "pet_scale")
+        {
+            // A banker companion is a minipet, which is not a guardian pet: the guardian slot
+            // alone would report nothing for a summon that worked. Resolve what the character has
+            // out, guardian first, then the companion slot the summon path keeps.
+            Creature* pet = player->GetGuardianPet();
+            if (!pet)
+                pet = player->GetCompanionPet();
+            if (!pet && player->GetCritterGUID())
+                pet = ObjectAccessor::GetCreatureOrPetOrVehicle(*player, player->GetCritterGUID());
             if (metric == "pet_entry")
                 return pet ? pet->GetEntry() : 0;
+            // What a summoned banker is judged on: the flag the core's own bank handler asks the
+            // unit for, plus the display and the scale the client draws it at.
+            if (metric == "pet_is_banker")
+                return pet && pet->HasNpcFlag(UNIT_NPC_FLAG_BANKER);
+            if (metric == "pet_display")
+                return pet ? pet->GetDisplayId() : 0;
+            if (metric == "pet_scale")
+                return pet ? double(pet->GetObjectScale()) : 0.0;
             if (!pet && (metric == "pet_aura_stacks" || metric == "pet_aura_amount" || metric == "pet_aura_amplitude_ms"))
                 return 0;
             Require(pet != nullptr, "Metric needs a current pet");
@@ -1823,6 +1861,57 @@ private:
             record.put("item", entry);
             record.put("received", after - before);
         }
+        else if (action == "area_trigger")
+        {
+            // The client's own packet on walking into a trigger. It is the only way a character
+            // becomes rested here - the inn triggers are what set PLAYER_FLAGS_RESTING - and the
+            // ruleset selection spells refuse to apply outside a rested area.
+            WorldPacket packet(CMSG_AREATRIGGER, 4);
+            packet << step.get<uint32>("id");
+            player->GetSession()->HandleAreaTriggerOpcode(packet);
+        }
+        else if (action == "banker_activate")
+        {
+            // The client's own click on a banker: CMSG_BANKER_ACTIVATE carrying the unit's GUID.
+            // Aimed at the summoned companion by default, so the whole path a player's right click
+            // takes is exercised - the flag the client offers it on, the core's interaction check
+            // and the native bank window that answers.
+            ObjectGuid guid;
+            if (auto target = step.get_optional<std::string>("target"))
+                guid = GetUnit(*target)->GetGUID();
+            else if (auto owner = step.get_optional<std::string>("owner"))
+            {
+                // Somebody else's summoned creature: the click a character makes on a companion
+                // that is not theirs, which is the script that owns that companion to answer.
+                Creature* owned = GetOwnedCreature(GetPlayer(*owner), step.get<uint32>("entry"));
+                Require(owned != nullptr, "That actor has no creature of that entry out");
+                guid = owned->GetGUID();
+            }
+            else
+            {
+                Creature* companion = player->GetGuardianPet();
+                if (!companion)
+                    companion = player->GetCompanionPet();
+                if (!companion && player->GetCritterGUID())
+                    companion = ObjectAccessor::GetCreatureOrPetOrVehicle(*player, player->GetCritterGUID());
+                Require(companion != nullptr, "Banker activate needs a target or a summoned companion");
+                guid = companion->GetGUID();
+            }
+            // A click reaches the core's own checks only from in reach, so the actor walks up to
+            // whatever it is about to click - the one thing a player does before clicking it. A
+            // companion can be left behind by a scenario teleport, and that is a fixture artifact
+            // rather than the behaviour under test.
+            if (Creature* clicked = ObjectAccessor::GetCreatureOrPetOrVehicle(*player, guid))
+                if (!clicked->IsWithinDistInMap(player, INTERACTION_DISTANCE))
+                    // Placed, not teleported: a same-map teleport only lands when the client
+                    // acknowledges it, and this click is sent in the same tick.
+                    player->UpdatePosition(clicked->GetPositionX(), clicked->GetPositionY(),
+                                           clicked->GetPositionZ(), player->GetOrientation(), true);
+
+            WorldPacket packet(CMSG_BANKER_ACTIVATE, 8);
+            packet << guid;
+            player->GetSession()->HandleBankerActivateOpcode(packet);
+        }
         else if (action == "gossip_hello")
         {
             ObjectGuid guid = step.get_optional<std::string>("target") ?
@@ -1942,6 +2031,10 @@ private:
         }
         else if (action == "cast" || action == "cast_charm" || action == "use_item")
         {
+            // A refusal recorded earlier in this session belongs to an earlier attempt at the same
+            // spell. Forget it here, so `cast_failure` answers for the cast just submitted instead
+            // of reporting a refusal the character has since been allowed past.
+            _actors.at(step.get<std::string>("actor")).castFailureReason.erase(spell);
             SpellCastTargets targets;
             Unit* caster = action == "cast_charm" ? player->GetCharm() : player;
             Require(caster != nullptr, "Player has no charmed unit");
