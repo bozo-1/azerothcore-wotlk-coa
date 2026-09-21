@@ -238,9 +238,31 @@ struct Actor
     uint32 buysGranted = 0;
     uint32 buysUnannounced = 0;
     uint32 buysMisannounced = 0;
+    uint32 supersededPackets = 0;                 // SMSG_SUPERCEDED_SPELL this session has received
+    std::map<uint32, uint32> supersededFor;       // new rank -> how many supersede cues announced it
+    // Every packet the client would announce a learned spell from, by the ordinal it arrived at:
+    // SMSG_LEARNED_SPELL for an ability the character did not have, SMSG_SUPERCEDED_SPELL for a
+    // rank up. A purchase is announced exactly once, so a scenario counts them between two
+    // purchases - zero is a purchase the client said nothing about and two is a chat line too
+    // many, whatever produced them.
+    std::vector<std::pair<uint32, uint32>> announcements;
+    uint32 lastBuyOrdinal = 0;
+    // What the last granted purchase announced, in the order it arrived: the count, and the
+    // abilities the cues named. A purchase is judged on the whole of this - one cue naming the
+    // ability that was bought - rather than on the session's totals, which the arrange phase
+    // and the purchase after it would otherwise mix together.
+    uint32 lastBuyCues = 0;
+    std::vector<uint32> lastBuyCueIds;
+    uint32 buysSilent = 0;      // a granted purchase the client had nothing to announce
+    uint32 buysMulti = 0;       // a granted purchase the client was told about more than once
     uint32 trainerWindows = 0;                    // trainer windows this session has been sent
     uint32 trainerWindowRows = 0;                 // rows in the last of them
     std::map<uint32, uint8> trainerWindowState;   // spell -> the state byte that window gave the row
+    // spell -> the ability its row requires. A row carries the rank directly under it as that
+    // requirement, so this is the field that says how a ladder is chained: the client draws it
+    // red until the character holds it, which is what a scenario has to read to tell a rank the
+    // window offers from one the purchase will accept.
+    std::map<uint32, uint32> trainerWindowAbility;
     uint32 whoResponses = 0;
     uint32 lootReceived = 0;
     std::array<uint32, 2> meleeAttacksByHand{};
@@ -656,6 +678,22 @@ private:
                     packet.GetOpcode() == SMSG_QUESTGIVER_QUEST_DETAILS)
                     actor.lastQuestWindow = packet.GetOpcode();
 
+                // A rank up is answered with this instead of a learned-spell packet, and the
+                // client announces it from here, so a ladder swap that also arrived with a
+                // learned-spell packet was announced twice. The pair is read so a scenario can
+                // ask about one spell's cue rather than the session's total: two cues for the
+                // same new rank is a purchase announced twice, whatever produced them.
+                if (packet.GetOpcode() == SMSG_SUPERCEDED_SPELL)
+                {
+                    ++actor.supersededPackets;
+                    WorldPacket swap(packet);
+                    uint32 previous = 0;
+                    uint32 replacement = 0;
+                    swap >> previous >> replacement;
+                    ++actor.supersededFor[replacement];
+                    actor.announcements.emplace_back(actor.packetOrdinal, replacement);
+                }
+
                 // SMSG_LEARNED_SPELL is what drives the client's "New Spell Learned!" alert
                 // and its sound, so a scenario can assert that acquiring an ability announced
                 // itself however it was powered.
@@ -666,6 +704,7 @@ private:
                     announcement >> announced;
                     ++actor.learnedAlerts[announced];
                     actor.announced.insert(announced);
+                    actor.announcements.emplace_back(actor.packetOrdinal, announced);
                 }
 
                 // Which of the two answers a purchase got: the book module and the core both
@@ -691,10 +730,29 @@ private:
                         // spell that never arrived by now never will.
                         if (!actor.announced.count(bought))
                             ++actor.buysUnannounced;
-                        // Each row is bought once, so an announced count other than one is a
-                        // purchase the client was told about zero times or twice.
-                        if (actor.learnedAlerts[bought] != 1)
+                        // A purchase is announced once: by the core's learned-spell packet when
+                        // the grant superseded nothing, or by the client itself from the
+                        // supersede packet when it was a rank up. Any second announcement for
+                        // the same spell is the duplicate this guards against - a rank up that
+                        // also had a learned-spell packet sent for it showed two chat lines.
+                        if (actor.learnedAlerts[bought] > 1)
                             ++actor.buysMisannounced;
+                        // And it is announced at all: what the core sends between the previous
+                        // purchase and this one is what the client draws a chat line from, so
+                        // nothing here is a purchase that showed no line and two is a purchase
+                        // that showed two.
+                        actor.lastBuyCueIds.clear();
+                        for (std::pair<uint32, uint32> const& entry : actor.announcements)
+                            if (entry.first > actor.lastBuyOrdinal)
+                                actor.lastBuyCueIds.push_back(entry.second);
+
+                        uint32 const sinceBuy = uint32(actor.lastBuyCueIds.size());
+                        actor.lastBuyCues = sinceBuy;
+                        if (!sinceBuy)
+                            ++actor.buysSilent;
+                        else if (sinceBuy > 1)
+                            ++actor.buysMulti;
+                        actor.lastBuyOrdinal = actor.packetOrdinal;
                     }
                     else
                         ++actor.buyFailed[bought];
@@ -714,6 +772,7 @@ private:
                     ++actor.trainerWindows;
                     actor.trainerWindowRows = rows > 0 ? uint32(rows) : 0;
                     actor.trainerWindowState.clear();
+                    actor.trainerWindowAbility.clear();
                     for (int32 i = 0; i < rows; ++i)
                     {
                         int32 rowSpell = 0;
@@ -730,7 +789,10 @@ private:
                         window >> rowSpell >> state >> price >> pointCost0 >> pointCost1 >> requiredLevel
                                >> skillLine >> skillRank >> ability1 >> ability2 >> ability3;
                         if (rowSpell > 0)
+                        {
                             actor.trainerWindowState[uint32(rowSpell)] = state;
+                            actor.trainerWindowAbility[uint32(rowSpell)] = ability1;
+                        }
                     }
                 }
 
@@ -1152,7 +1214,8 @@ private:
         if (metric == "knows_spell" || metric == "cooldown_ms" || metric == "spell_charges" ||
             metric == "global_cooldown_ms" || metric == "has_talent" ||
             metric == "spellbook_offers_spell" || metric == "spellbook_covers_spell" ||
-            metric == "trainer_window_state" || metric == "temporary_spell_replacement")
+            metric == "trainer_window_state" || metric == "trainer_window_ability" ||
+            metric == "temporary_spell_replacement")
             Require(sSpellMgr->GetSpellInfo(spell) != nullptr, "Unknown spell in metric");
         if (metric == "knows_spell")
             return player->HasSpell(spell);
@@ -1194,6 +1257,26 @@ private:
             auto const found = alerts.find(spell);
             return found == alerts.end() ? 0.0 : double(found->second);
         }
+        if (metric == "spellbook_superseded_packets")
+            return double(_actors.at(step.get<std::string>("actor")).supersededPackets);
+        if (metric == "spellbook_silent_buys" || metric == "spellbook_multi_announced_buys")
+        {
+            Actor const& actor = _actors.at(step.get<std::string>("actor"));
+            return double(metric == "spellbook_silent_buys" ? actor.buysSilent : actor.buysMulti);
+        }
+        if (metric == "spellbook_superseded_for")
+        {
+            auto const& swaps = _actors.at(step.get<std::string>("actor")).supersededFor;
+            auto const found = swaps.find(spell);
+            return found == swaps.end() ? 0.0 : double(found->second);
+        }
+        if (metric == "spellbook_cues_in_last_buy")
+            return double(_actors.at(step.get<std::string>("actor")).lastBuyCues);
+        if (metric == "spellbook_last_buy_cued")
+        {
+            auto const& cued = _actors.at(step.get<std::string>("actor")).lastBuyCueIds;
+            return std::find(cued.begin(), cued.end(), spell) == cued.end() ? 0.0 : 1.0;
+        }
         if (metric == "trainer_list_packets")
             return double(_actors.at(step.get<std::string>("actor")).trainerWindows);
         if (metric == "trainer_window_rows")
@@ -1202,7 +1285,15 @@ private:
         {
             auto const& window = _actors.at(step.get<std::string>("actor")).trainerWindowState;
             auto const found = window.find(spell);
-            // Absent is its own answer: the row the book used to sell is gone rather than refused.
+            // Absent is its own answer: the window holds no row for this ability at all, which is
+            // how a scenario tells a row that is not sold from one that is refused.
+            return found == window.end() ? -1.0 : double(found->second);
+        }
+        if (metric == "trainer_window_ability")
+        {
+            auto const& window = _actors.at(step.get<std::string>("actor")).trainerWindowAbility;
+            auto const found = window.find(spell);
+            // Absent, like the state byte: the window holds no row for this spell at all.
             return found == window.end() ? -1.0 : double(found->second);
         }
         if (metric == "quest_rewarded")
@@ -1799,6 +1890,11 @@ private:
             return;
         }
         Player* player = GetPlayer(id);
+        // The announcements a purchase is judged on are the ones this step produces: the arrange
+        // phase learns spells and announces them too, so the window starts with the step rather
+        // than with the session's first purchase.
+        if (auto const found = _actors.find(id); found != _actors.end())
+            found->second.lastBuyOrdinal = found->second.packetOrdinal;
         uint32 spell = step.get<uint32>("spell", 0);
         if (action == "learn" || action == "unlearn" || action == "cast" || action == "cast_charm")
             Require(sSpellMgr->GetSpellInfo(spell) != nullptr, "Unknown spell: " + std::to_string(spell));

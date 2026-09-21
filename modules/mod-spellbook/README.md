@@ -19,16 +19,26 @@ restored to this realm's trainer data at all.
   class - the realm's class spell data, the client's rank ladders and the recovered tables below.
   The list is the server's own trainer list, so a book opened by another player still shows the
   viewer's class, and `Train` (`CMSG_TRAINER_BUY_SPELL`) learns the rank and charges its price.
-- **The refresh.** Because the row set is the server's, a purchase republishes the window: the rank just
-  bought leaves it and the rank above it becomes trainable in the same window, so a rank ladder is bought in
-  a row instead of one rank per reopen. A client redraws a trainer window only when a new one arrives, which
-  is why reopening the book showed the next rank — the refresh sends the same state the player used to get
-  by closing and reopening.
+- **Buying a ladder in a row.** Every row carries the rank directly beneath it as its requirement, which is
+  what the original window published — the captured offer list reads "Witchblight (Rank 2)" on the rank-3
+  row. A rank the character holds stays in the list as a *used* row, the way a stock trainer greys the row it
+  just sold, so a purchase republishes the same rows in the same order: the rank just bought turns used and
+  the rank above it turns trainable, both in place. Nothing renumbers, so the client's own restore of its
+  selection and scroll position lands on the row the player was on and the list does not move under them. A
+  rank whose prerequisite is missing, or whose level is above the character, arrives unavailable — and is
+  refused by the server as well, so nothing is bought early. A row the character already has a rank above
+  is a used row too: such a rank is not an upgrade, and the core only moves it between specs without
+  announcing it, while announcing the rank it pulls into the active spec instead — which used to show a
+  chat line for a rank the player had not bought. The rank above a held one is still sold normally.
 - **The alert.** Before a spell is learned, the module sends the client the row of its own
   `SpellCustomAttr` table for that spell with the notable bit set (`SMSG_PATCH_SPELL_CUSTOM_ATTR`).
   That bit is what makes the client show *New Spell Learned* and play its sound: a rank up of an
   ability whose row lacks it - or a spell the table has no row for - is otherwise silent, which is
   the way a purchase used to succeed with no popup at all.
+  The announcement itself is never sent from here. A grant that supersedes nothing is announced by
+  the core's own `SMSG_LEARNED_SPELL`, and a rank up is answered with `SMSG_SUPERCEDED_SPELL`, which
+  the client announces on its own. Sending a learned-spell packet on top of that cue announced every
+  rank up twice in chat.
 - **Automatic delivery off.** The books are how a character earns abilities, so this change ships
   `AscensionCompat.AutoProgression = 0` (config file and code default) in `mod-ascension-compat`:
   the class spells, rank upgrades and automatic talents that module handed out on level up are no
