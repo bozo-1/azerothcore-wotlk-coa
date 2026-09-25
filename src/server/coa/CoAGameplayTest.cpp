@@ -353,6 +353,10 @@ struct Actor
     uint32 trainerWindowRows = 0;
     std::map<uint32, uint8> trainerWindowState;
     std::map<uint32, uint32> trainerWindowAbility;
+    uint32 vendorWindows = 0;
+    uint32 vendorItems = 0;
+    std::map<uint32, uint32> vendorPrice;
+    uint32 vendorPriceSum = 0;
     uint32 whoResponses = 0;
     uint32 lootReceived = 0;
     std::array<uint32, 2> meleeAttacksByHand{};
@@ -747,6 +751,36 @@ void ObservePacket(Actor& actor, WorldPacket const& packet)
             {
                 actor.trainerWindowState[uint32(rowSpell)] = state;
                 actor.trainerWindowAbility[uint32(rowSpell)] = ability1;
+            }
+        }
+    }
+
+    if (packet.GetOpcode() == SMSG_LIST_INVENTORY)
+    {
+        WorldPacket shelves(packet);
+        ObjectGuid vendor;
+        uint8 rows = 0;
+        shelves >> vendor >> rows;
+        ++actor.vendorWindows;
+        actor.vendorItems = rows;
+        actor.vendorPrice.clear();
+        actor.vendorPriceSum = 0;
+        for (uint8 i = 0; i < rows; ++i)
+        {
+            uint32 slot = 0;
+            uint32 shelfItem = 0;
+            uint32 displayId = 0;
+            int32 leftInStock = 0;
+            uint32 price = 0;
+            uint32 durability = 0;
+            uint32 buyCount = 0;
+            uint32 extendedCost = 0;
+            shelves >> slot >> shelfItem >> displayId >> leftInStock >> price
+                    >> durability >> buyCount >> extendedCost;
+            if (shelfItem != 0)
+            {
+                actor.vendorPrice[shelfItem] = price;
+                actor.vendorPriceSum += price;
             }
         }
     }
@@ -1660,6 +1694,18 @@ private:
             auto const& window = _actors.at(step.get<std::string>("actor")).trainerWindowAbility;
             auto const found = window.find(spell);
             return found == window.end() ? -1.0 : double(found->second);
+        }
+        if (metric == "vendor_list_packets")
+            return double(_actors.at(step.get<std::string>("actor")).vendorWindows);
+        if (metric == "vendor_items")
+            return double(_actors.at(step.get<std::string>("actor")).vendorItems);
+        if (metric == "vendor_price_sum")
+            return double(_actors.at(step.get<std::string>("actor")).vendorPriceSum);
+        if (metric == "vendor_price")
+        {
+            auto const& prices = _actors.at(step.get<std::string>("actor")).vendorPrice;
+            auto const found = prices.find(step.get<uint32>("item", 0));
+            return found == prices.end() ? -1.0 : double(found->second);
         }
         if (metric == "quest_rewarded")
         {
