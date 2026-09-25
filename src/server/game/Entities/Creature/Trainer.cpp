@@ -34,7 +34,7 @@ namespace Trainer
         _greeting[DEFAULT_LOCALE] = std::move(greeting);
     }
 
-    void Trainer::SendSpells(Creature* npc, Player* player, LocaleConstant locale) const
+    void Trainer::SendSpells(Creature* npc, Player* player, LocaleConstant locale, bool onlyTrainable) const
     {
         float reputationDiscount = player->GetReputationPriceDiscount(npc);
 
@@ -46,6 +46,13 @@ namespace Trainer
         for (Spell const& trainerSpell : _spells)
         {
             if (!player->IsSpellFitByClassAndRace(trainerSpell.SpellId))
+                continue;
+
+            // The state is asked once and then decides both whether the row is written at all and what
+            // the row reads: the same call that gates the purchase gates the window, so a trainer can
+            // never leave out a spell it would have sold, or offer a row it would have refused.
+            SpellState spellState = GetSpellState(player, &trainerSpell);
+            if (onlyTrainable && spellState == SpellState::Unavailable)
                 continue;
 
             SpellInfo const* trainerSpellInfo = sSpellMgr->AssertSpellInfo(trainerSpell.SpellId);
@@ -64,7 +71,7 @@ namespace Trainer
             trainerList.Spells.emplace_back();
             WorldPackets::NPC::TrainerListSpell& trainerListSpell = trainerList.Spells.back();
             trainerListSpell.SpellID = trainerSpell.SpellId;
-            trainerListSpell.Usable = AsUnderlyingType(GetSpellState(player, &trainerSpell));
+            trainerListSpell.Usable = AsUnderlyingType(spellState);
             trainerListSpell.MoneyCost = int32(trainerSpell.MoneyCost * reputationDiscount);
             trainerListSpell.PointCost[0] = 0; // spells don't cost talent points
             trainerListSpell.PointCost[1] = (primaryProfessionFirstRank ? 1 : 0);

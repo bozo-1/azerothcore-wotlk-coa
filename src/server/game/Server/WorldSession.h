@@ -580,7 +580,9 @@ public:
     void SendNameQueryOpcode(ObjectGuid guid);
     void SendItemQuerySingleResponse(uint32 item);
 
-    void SendTrainerList(Creature* npc);
+    /// `onlyTrainable` leaves out the rows of the window the player cannot buy yet; see
+    /// Trainer::SendSpells.
+    void SendTrainerList(Creature* npc, bool onlyTrainable = false);
     void SendListInventory(ObjectGuid guid, uint32 vendorEntry = 0);
     void SendShowBank(ObjectGuid guid);
     bool CanOpenMailBox(ObjectGuid guid);
