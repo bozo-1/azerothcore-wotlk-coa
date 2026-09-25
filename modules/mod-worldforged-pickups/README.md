@@ -1087,6 +1087,76 @@ filled green, the five whose object moved to a new guid carry the guid the alloc
 the eight rows the walk left empty are kept on the sheet and marked removed, so the markers the
 walk took out stay visible. The sheet stands **38 pickups, 30 of them authored in game**, and its
 Index row says the same.
+### The final authored pass: Duskwood, item by item
+
+`2026_09_25_48_worldforged_duskwood_pass_authored.sql` is the zone walked by hand in the map editor,
+read from the editing project's **58 changesets** (`pro2`, written on 2026-09-25), one save each, the
+last write to a row winning. The tract is Duskwood itself and the ten areas that stand inside it -
+Raven Hill, Raven Hill Cemetery, Darkshire, The Darkened Bank, Brightwood Grove, Addle's Stead,
+Beggar's Haunt, Vul'Gol Ogre Mound, Forlorn Rowe and Manor Mistmantle - and **48 pickups** stand in
+it when the walk is done: **39 placed by hand in this pass** (the 30 rows below and the 9 placements
+after them) and **9 that the earlier passes left standing**, each on the marker the realm map records
+for it. Position and the rotation quaternion are the editor's own, digit for digit, and the
+orientation column is written as the yaw that quaternion represents.
+
+* **30 rows of this module were moved and/or turned, 27 of them by more than half a yard.** The
+  furthest: **Sizzling Potion** (1345132, guid 6941088) 150.67 yd, out of the Westfall-side listing
+  it stood on and onto the Vul'Gol Ogre Mound spot the editor gave it; **Axe of the Frostmane**
+  (95514, 6940510) 115.73; **Catacombs Relic Torch** (90282, 6940226) 78.02; **Lantern of Endless
+  Sorrow** (254366, 6941115) 50.22; **Darkshire Grave** (90272, 6940393) 33.56; **Spare Bag** (95821,
+  6940709, the placing that hands out Lohgan's Best Bag) 26.40; **Catacomb Grave Dirt Pile** (90286,
+  6940603) 24.90; **Suspiciously Brown Discarded Pants** (95824, 6941180) 23.78; **Fallen Warrior's
+  Axe** (95942, 6940459) 19.56; **Silk Covered Spaulders** (95823, 6941083) 18.41; **Haren's Tankard**
+  (1345067, 6940361) 16.46; and sixteen more from **The Dark Soul** (95822, 6941212) at 14.01 yd down
+  to **Emerald Shard** 0.62.
+* **11 rows turned**, the largest **Defias Night Blade** (90274, guid 6940342) **3.051 rad** (174.8
+  deg), then **Sizzling Potion** 2.491, **Catacombs Relic Torch** 2.203 (126.2 deg), **Emerald
+  Shard** 1.025, **Darkest Night Ring** (6940309) 0.448, **Suspiciously Brown Discarded Pants**
+  0.333, **Nightwatch Circlet** (6940811) 0.301, **The Jitters** (6941215) 0.212 and three more below
+  a tenth of a radian.
+* **Three of the saves' own orientation columns disagree with the quaternion beside them**, and the
+  file says so at each row: **Catacomb Grave Dirt Pile** (6940224, column 1.7031 against 2.0029),
+  **Emerald Shard** (6940431, 0.9171 against 2.3663) and **Sharp Bone Necklace** (6930015, 2.2626
+  against 2.5623). The quaternion is the field the client draws the model with, so the quaternion is
+  what is written.
+* **14 markers were emptied by hand**, and no guid of them is left in the world: Distant Wanderer's
+  Pack (6940366), Emerald Shard (6940430), Grimtotem Totem (6940576), Holy Atal'ai Band (6940633),
+  Ice Beard's Furled Finger (6940516), Lost Mountaineer's Bow (6940722), Racing Goggles (6941285),
+  Resonite Band (6940952), Ritual Blade (6940705), Sharp Bone Necklace (6940905), Spear of Emerald
+  (6941122), Will in the Casket (6940223), Wood Pile (6940862) and Woven Ceremonial Belt (6941354).
+* **Eight of those fourteen stand again where the editor placed them, on guids this file allocates**,
+  each keeping the loot row its object already had - the row hangs on the object, not the placement:
+  **Spear of Emerald** (254369, guid 6960027), **Ritual Blade** (515438, 6960028), **Resonite Band**
+  (254230, 6960029), **Woven Ceremonial Belt** (254231, 6960030), **Distant Wanderer's Pack**
+  (254384, 6960031), **Lost Mountaineer's Bow** (95507, 6960033), **Will in the Casket** (90281,
+  6960034) and **Sharp Bone Necklace** (90285, 6960035).
+* **One placement is new rather than a re-placing.** The editor's save of 10:32:01 creates **Crimson
+  Blade** (254562, guid 6960032) at -11232.0 -886.6 in the zone, and the object is written whole, with
+  its comment naming the save that stands it.
+* **Six markers are left nowhere else**: **Emerald Shard** (90290, was 6940430 at -10922.0 -516.5),
+  **Ice Beard's Furled Finger** (95515, was 6940516 at -10691.8 -205.8), **Grimtotem Totem** (254227,
+  was 6940576 at -9999.4 -1067.5), **Holy Atal'ai Band** (254368, was 6940633 at -10728.4 256.3),
+  **Wood Pile** (90348, was 6940862 at -11192.0 -435.5) and **Racing Goggles** (515537, was 6941285 at
+  -10753.1 426.7).
+* **Two placements the zone's own sheet had missed are in it now**, both found by reading every
+  changeset row against the world: **Sharp Bone Necklace** (90285, guid **6930015**, Raven Hill
+  Cemetery), whose spawn row carries no `ScriptName` at all while its template carries
+  `worldforged_pickup`, and **Crimson Blade** (254562, guid **6960032**, Duskwood).
+* **Nothing that is not this module's is touched.** The same saves move two objects the world itself
+  owns - **Bruiseweed** (guid 207693) and **Mageroyal** (guid 207604) - and the file names both in its
+  header as deliberately left alone.
+
+**How the numbers were checked.** Every statement is an UPDATE on a guid, a REPLACE on a guid the
+file allocates, or a DELETE on a guid the editor deleted, so re-running it leaves the same rows; the
+file was applied to the live database and applied a second time to prove it. Afterwards every row was
+read back from the database one by one: **118 assertions, none failing** - each of the 30 moved rows
+against its position, its rotation quaternion, the yaw that quaternion represents, its entry and its
+script; the placement on guid 6930015 and each of the nine guids the file allocates, field for field;
+and the absence of all fourteen removed guids. The worldserver applies the file itself on boot
+(`Applying update "2026_09_25_48_worldforged_duskwood_pass_authored.sql"`), and the realm then reads
+**99,470 gameobjects**, **2,822 worldforged pickups** over **1,662 distinct ids** and **1,805 pickup
+templates**.
+
 ### The nineteenth pass: Dun Morogh and Coldridge Valley, paired marker by marker
 
 `2026_09_23_16_worldforged_dun_morogh.sql` is the pass that moved the marker set itself, and
