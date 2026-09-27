@@ -378,6 +378,8 @@ normal calculations, useful for preventing misses, dodges and parries in determi
 Optional `allow_regeneration: false` suppresses only that fixture player's ordinary health/power regeneration
 through the native regeneration hook. Spell costs, healing, energize effects and combat remain enabled.
 It defaults to true and has no effect on other players or on a disabled harness.
+Optional `expansion` (0..2, default 2) is the fixture session's expansion, as a realm with a lower `Expansion`
+setting caps a real client's; it gates maps and profession ranks.
 Characters are created and loaded through the existing character creation, enumeration and login
 handlers with ordinary player security. Optional `location` supplies `map`, `x`, `y`, `z`, `o` for a fixture
 teleport. `location.ignore_access` optionally bypasses entry requirements for a fixture (for example a solo
@@ -395,7 +397,9 @@ area, zone or map range, which `system_messages` counts.
 
 Creatures require `id`, player `owner` and template `entry`. Optional `distance` offsets X from their owner
 (default 3 yards); `faction`, `level`, `health` default to 14, 80, 100000. They retain template data and AI,
-with passive reaction and health regeneration disabled. Pick a template whose scripts suit the experiment.
+with passive reaction and health regeneration disabled. The native player-damage share a kill needs for loot and
+reward is taken from the declared health, so a player's kill leaves a lootable or skinnable corpse. Pick a
+template whose scripts suit the experiment.
 Setup clears combat initiated by spawn-time AI before starting the scenario: a fixture whose AI engaged a player
 while spawning evades at once. No step runs while any fixture is evading, so a spell or attack is never aimed at
 a fixture that is resetting; the step's time keeps running meanwhile. Combat otherwise follows normal rules.
@@ -452,7 +456,8 @@ This fixture supports exact health-percentage boundaries without granting GM per
 
 `gather_skill` calls `UpdateGatherSkill`; it does not harvest a node or prove loot delivery.
 
-`xp` and `next_level_xp` read the player's XP fields; `skill_value` requires `skill` and reads pure skill.
+`xp` and `next_level_xp` read the player's XP fields; `skill_value` and `skill_maximum` require `skill` and read
+the pure skill value and maximum. `spell_active` requires `spell` and reports whether a known rank is the active one.
 XP-delta assertions must also keep the level stable, or crossing a level would wrap the XP bar.
 
 Every step accepts a descriptive `label`. Assertions optionally accept `within_ms`: poll until the expected
@@ -598,6 +603,8 @@ and closes its current loot window. `collect_loot` takes `actor`, collects slot 
 quantity reached inventory and records the item/count. It supports ordinary container loot, not quest-only slots.
 `loot_count` and `loot_entry` report the actor's current uncollected item slots and first entry; `loot_received`
 reports the inventory increase from its last successful `collect_loot`. Closed windows return zero slots/entry.
+`creature_loot_quality_rate` requires `entry` (a creature loot id), fills that template `rolls` times (default 10000)
+for the actor and reports the percentage of fills holding an item of at least `quality` (default 3, rare).
 `quest_rewarded` requires `quest` and reads the player's native rewarded status.
 `prepare_quest` takes `actor` and `quest`, adds the quest and required delivery items, then completes its objectives (unless `complete` is false, which leaves the quest in progress)
 as fixture setup. `reward_quest` takes the same fields and optional zero-based `choice` (default 0); it checks normal
@@ -666,6 +673,9 @@ Faerie Fire (770) supplies a 5% armor reduction. Spell 705798 uses melee hit res
 sets melee hit and expertise as well as spell hit. Template 1501 has HealthModifier 0.93: the level-1
 fixture's real pool remains 40 HP while its level-57 view has 2,590 HP. Ten one-damage hits cannot remove
 a whole real HP; 67 remove one.
+
+`scenarios/skinning-dungeon-scaled-view.json` and `scenarios/skinning-open-world-level-scaling.json` need the
+same settings: the skinning requirement follows a view that lowers a dungeon creature, never one that lifts it.
 
 `scenarios/destiny-weaver-quest-fallback.json` requires a separate run with `DestinyWeaver.Enable=0`
 and `CoA.QuestLevelScaling=1`. Quest 7 must still scale to the player's level and award XP.
