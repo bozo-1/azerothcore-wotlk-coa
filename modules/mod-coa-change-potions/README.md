@@ -150,7 +150,8 @@ The module supplies the missing halves from the realm's own data:
 
   The class itself is written where the realm reads it: the class byte of `UNIT_FIELD_BYTES_0` for
   the session (with a forced values update so the client agrees), `characters.class` for the
-  database, and the character cache is refreshed so the character list already shows the new class.
+  database (written synchronously), and the character cache is refreshed from that row so name
+  queries from other clients already report the new class.
   Base stats are rebuilt (`InitStatsForLevel` / `UpdateAllStats`) and the resource type follows the
   class. `playercreateinfo_action` — the starting action bar, seeded for classes 12…32 by this
   repository's own updates — is copied onto the bar, because a class change cannot keep the old

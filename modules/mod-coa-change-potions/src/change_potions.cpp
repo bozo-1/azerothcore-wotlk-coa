@@ -145,6 +145,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -430,9 +431,10 @@ void AcknowledgeAndConsume(Player* player, Item* item)
 //     Map::Update                Map.cpp:491
 //
 // WorldScript::OnUpdate is called from World::Update on the world thread - the thread the core's
-// own instant logout runs on (WorldSession::HandleLogoutRequestOpcode -> LogoutPlayer), and the
-// thread every session packet is handled on, including the item use and the gossip pick that
-// schedule this.
+// own instant logout runs on (WorldSession::HandleLogoutRequestOpcode -> LogoutPlayer).  The item use
+// that schedules a logout is not: CMSG_USE_ITEM is PROCESS_INPLACE, so an in-world player's use is
+// handled inside Map::Update, and with MapUpdate.Threads above one two maps can schedule at once.
+// The list is therefore locked, and the logouts themselves run after the lock is released.
 struct PendingLogout
 {
     ObjectGuid Guid;
@@ -440,6 +442,7 @@ struct PendingLogout
 };
 
 std::vector<PendingLogout> g_pendingLogouts;
+std::mutex g_pendingLogoutsLock;
 
 void ScheduleLogout(Player* player)
 {
@@ -447,6 +450,7 @@ void ScheduleLogout(Player* player)
         return;
 
     ObjectGuid const guid = player->GetGUID();
+    std::lock_guard<std::mutex> guard(g_pendingLogoutsLock);
     for (PendingLogout& pending : g_pendingLogouts)
         if (pending.Guid == guid)
         {
@@ -459,18 +463,25 @@ void ScheduleLogout(Player* player)
 
 void UpdatePendingLogouts(uint32 diff)
 {
-    for (auto itr = g_pendingLogouts.begin(); itr != g_pendingLogouts.end(); )
+    std::vector<ObjectGuid> due;
     {
-        if (itr->Remaining > diff)
+        std::lock_guard<std::mutex> guard(g_pendingLogoutsLock);
+        for (auto itr = g_pendingLogouts.begin(); itr != g_pendingLogouts.end(); )
         {
-            itr->Remaining -= diff;
-            ++itr;
-            continue;
+            if (itr->Remaining > diff)
+            {
+                itr->Remaining -= diff;
+                ++itr;
+                continue;
+            }
+
+            due.push_back(itr->Guid);
+            itr = g_pendingLogouts.erase(itr);
         }
+    }
 
-        ObjectGuid const guid = itr->Guid;
-        itr = g_pendingLogouts.erase(itr);
-
+    for (ObjectGuid const& guid : due)
+    {
         Player* player = ObjectAccessor::FindPlayer(guid);
         WorldSession* session = player ? player->GetSession() : nullptr;
         if (!player || !session || session->GetPlayer() != player)
@@ -1179,8 +1190,10 @@ void ApplyClassChange(Player* player, Item* item, uint8 newClass)
     if (ChrClassesEntry const* classEntry = sChrClassesStore.LookupEntry(newClass))
         player->setPowerType(Powers(LiveClassResourcePolicy::DefaultPowerForClass(newClass, classEntry->powerType)));
 
-    CharacterDatabase.Execute("UPDATE `characters` SET `class` = {} WHERE `guid` = {}",
-                              uint32(newClass), player->GetGUID().GetCounter());
+    // Written synchronously: step 5 reads the row straight back into the character cache, and an
+    // asynchronous write can still be queued when it does, leaving the cache on the old class.
+    CharacterDatabase.DirectExecute("UPDATE `characters` SET `class` = {} WHERE `guid` = {}",
+                                    uint32(newClass), player->GetGUID().GetCounter());
 
     // 3. Base stats, powers and skills, then the starting bar: what a character of this class is
     //    built from before any spell is learned.  The health and resource refill is the one
@@ -1208,8 +1221,8 @@ void ApplyClassChange(Player* player, Item* item, uint8 newClass)
     //    progression the player has not chosen yet.
     GrantClass(player, base);
 
-    // 5. The character list takes its class from the character cache, so make it agree before the
-    //    logout lands - the player is looking at that screen ten seconds from now.
+    // 5. Name queries answer other clients from the character cache (and the character list reads
+    //    the row written above), so the cache is made to agree with the new class as well.
     sCharacterCache->RefreshCacheEntry(player->GetGUID().GetCounter());
 
     // 6. Spend the potion and say what happened.  The logout the notice promises is gone through
@@ -1447,8 +1460,7 @@ public:
     // the logout itself, which must not be done from a map event (see ScheduleLogout).
     void OnUpdate(uint32 diff) override
     {
-        if (!g_pendingLogouts.empty())
-            UpdatePendingLogouts(diff);
+        UpdatePendingLogouts(diff);
     }
 };
 }  // namespace
